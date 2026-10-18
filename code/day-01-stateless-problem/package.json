@@ -1,0 +1,11 @@
+{
+  "name": "day-01-stateless-problem",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Day 01 — a deliberately broken login server, built with zero dependencies to demonstrate why HTTP statelessness makes sessions and tokens necessary.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": ["authentication", "nodejs", "http", "learning"]
+}
