@@ -613,6 +613,6 @@ Tomorrow: **why plaintext passwords are unforgivable, what hashing actually is, 
 **Most developers with three years of experience have never asked why HTTP statelessness matters.**
 **You just did, on day one. Keep going. 🔥**
 
-[⬅️ Back to README](../../README.md) · [Day 02 ➡️ _(coming soon)_](#)
+[⬆️ README](../../README.md) · [Day 02 ➡️](day-02-password-hashing.md)
 
 </div>

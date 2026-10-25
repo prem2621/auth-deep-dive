@@ -41,6 +41,7 @@ This repo is the opposite approach. Every entry takes one concept all the way do
 | Day | Topic | Notes | Code |
 |:---:|-------|:-----:|:----:|
 | 01 | What is authentication? Why HTTP statelessness breaks everything | [📖 Read](notes/phase-1-foundations/day-01-what-is-authentication.md) | [💻 Run](code/day-01-stateless-problem/) |
+| 02 | The password problem — hashing, salt, bcrypt, timing attacks | [📖 Read](notes/phase-1-foundations/day-02-password-hashing.md) | [💻 Run](code/day-02-password-hashing/) |
 
 _More added as I go. Each entry lands here once it's actually finished — not before._
 
@@ -55,13 +56,19 @@ auth-deep-dive/
 │
 ├── notes/                             ← the deep-dive writeups (one per day)
 │   └── phase-1-foundations/
-│       └── day-01-what-is-authentication.md
+│       ├── day-01-what-is-authentication.md
+│       └── day-02-password-hashing.md
 │
 └── code/                              ← runnable code (one folder per day)
-    └── day-01-stateless-problem/
+    ├── day-01-stateless-problem/
+    │   ├── server.js
+    │   ├── package.json
+    │   └── README.md                  ← how to run + what to observe
+    └── day-02-password-hashing/
         ├── server.js
+        ├── test-work-factors.js
         ├── package.json
-        └── README.md                  ← how to run + what to observe
+        └── README.md
 ```
 
 **Naming rules (so the repo stays sortable forever):**
