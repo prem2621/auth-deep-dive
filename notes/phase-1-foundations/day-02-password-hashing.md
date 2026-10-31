@@ -449,6 +449,15 @@ Old rows verify with old settings (the cost is in the string, remember). Active 
 
 Full runnable version: [`code/day-02-password-hashing/`](../../code/day-02-password-hashing/)
 
+> [!TIP]
+> **Read this code first. Don't scroll past it.**
+>
+> Go top to bottom and try to work out what each line is doing on your own — no Google, no AI, no scrolling ahead. You will hit lines that make no sense. *Why is there a second error handler on `req`? What is `DUMMY_HASH` even for? Why count bytes instead of characters?*
+>
+> **That feeling is not a knowledge gap. That is what learning something new feels like.** I'm a beginner here too — every single one of those lines stopped me dead the first time I wrote it. So underneath the code I've answered all of them, in the same order they hit me.
+>
+> Read it yourself first. Then come down and check your guesses. If a question of yours isn't answered down there, that's a gap in *my* writing — [tell me](#-this-is-open-source--help-make-it-better) and I'll add it.
+
 ```js
 const http = require("http");
 const bcrypt = require("bcrypt");
@@ -568,7 +577,11 @@ Day 1 covered `require`, `createServer`, `req`/`res`, streams, chunks, `JSON.par
 
 ---
 
-### `const bcrypt = require("bcrypt");`
+### The one import that isn't built into Node
+
+```js
+const bcrypt = require("bcrypt");
+```
 
 Unlike `http`, this is **not** built into Node — you install it with `npm install bcrypt`.
 
@@ -579,7 +592,21 @@ One thing worth knowing: `bcrypt` is a **native module**. It ships C++ that gets
 
 ---
 
-### `function parseBody(req) { return new Promise(...) }`
+### Wrapping the request body in a Promise
+
+```js
+function parseBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = "";
+    req.on("data", (chunk) => (body += chunk.toString()));
+    req.on("end", () => {
+      try { resolve(JSON.parse(body)); }
+      catch { reject(new Error("Invalid JSON")); }
+    });
+    req.on("error", reject);
+  });
+}
+```
 
 Day 1 handled the body inline:
 
@@ -667,7 +694,156 @@ Flat, readable, and errors land in a normal `try/catch`. **The mechanics underne
 
 ---
 
-### `const DUMMY_HASH = bcrypt.hashSync(...)`
+> ### 🙋 WAIT — how does a user even *send* invalid JSON? They type text into a box and the frontend builds the JSON. So can this error actually happen?
+>
+> ```js
+> catch { reject(new Error("Invalid JSON")); }
+> ```
+>
+> **You're right about the normal path — and right for the right reason.** Follow it:
+>
+> ```txt
+> 1. User types  John  into a text box        →  just a string
+> 2. Frontend runs JSON.stringify({ username: "John" })
+> 3. JSON.stringify CANNOT produce broken JSON  →  that is its entire job
+> 4. A perfectly-formed body arrives at your server
+> ```
+>
+> On that path `JSON.parse` never throws. Not once. Ever.
+>
+> **The hidden assumption is step 1 — that every request comes from your website.** It doesn't. Your server has no idea what's on the other end of the connection. `http.createServer` sees raw text arriving on a port. It cannot tell a React app from a mobile app from somebody's terminal, and it never asks.
+>
+> Here are the three ways broken JSON genuinely reaches a production server.
+>
+> ---
+>
+> **① The frontend developer made a bug**
+>
+> They build the body by hand with string concatenation instead of `JSON.stringify` — or they use `JSON.stringify` correctly but forget `JSON.parse` on a value that was already a string. What leaves the browser is:
+>
+> ```txt
+> { "username": "John", "password": "password123"
+> ```
+>
+> No closing `}`. Nobody on the team notices, because the form *looks* like it submitted.
+>
+> Your 400 is the thing that tells them. Without it, that bug is invisible and reaches production.
+>
+> ---
+>
+> **② The connection died mid-transfer**
+>
+> A user on a train hits "Register" as they enter a tunnel. The frontend sent a perfect body; only part of it arrived:
+>
+> ```txt
+> {"username": "Jo
+> ```
+>
+> The stream ends, `"end"` fires, and `JSON.parse` is handed a sentence cut in half. **Nobody did anything wrong here** — not the user, not the developer. The network just lost. This case alone is enough reason for the check to exist.
+>
+> ---
+>
+> **③ Somebody skipped your frontend entirely — the common one**
+>
+> Attackers don't use your nice signup form. They talk to your API directly with `curl`, Postman, or a script. Every validation rule you wrote in JavaScript on the frontend — required fields, minimum length, "passwords must match" — **is skipped completely.** It was never a security control. It was a convenience for honest users.
+>
+> Watch it happen. This is one terminal command against the server you're running right now:
+>
+> ```bash
+> curl -X POST http://localhost:3000/register \
+>      -H "Content-Type: application/json" \
+>      -d '{"username": "hacker", "password": '
+> ```
+>
+> The body stops mid-sentence: no password value, no closing quote, no `}`. Now trace it through your own code:
+>
+> ```txt
+> 1. req.on("data")  →  body += '{"username": "hacker", "password": '
+> 2. req.on("end")   →  fires normally, the request DID complete
+> 3. JSON.parse(body)  →  💥 SyntaxError: Unexpected end of JSON input
+> 4. catch            →  reject(new Error("Invalid JSON"))
+> 5. route catch (err) →  err.message === "Invalid JSON"  →  400
+> ```
+>
+> > 🧪 **PROVEN ON MY MACHINE** — that exact command, against this server:
+> >
+> > ```txt
+> > HTTP/1.1 400 Bad Request
+> > {"error":"Invalid JSON"}
+> > ```
+> >
+> > And the one-second version — no body at all, so `body` stays `""` and `JSON.parse("")` throws:
+> >
+> > ```txt
+> > $ curl -X POST http://localhost:3000/login
+> > {"error":"Invalid JSON"}
+> > ```
+>
+> Here's what it costs you to be missing that `try/catch`. `JSON.parse` doesn't return `null` on bad input — it **throws**. Thrown inside an async handler with nothing to catch it, that's an unhandled rejection, and Node kills the process:
+>
+> ```txt
+>                     ONE malformed request body
+>                                │
+>              ┌──────────────────┴──────────────────┐
+>              │                                     │
+>     ✅ try/catch present               ❌ no try/catch
+>              │                                     │
+>     400 Bad Request                   SyntaxError thrown
+>              │                                     │
+>     server keeps serving              unhandled rejection
+>     every other user                           │
+>              │                          process exits
+>          nothing burns                         │
+>                                    🔥 site down for EVERYONE
+> ```
+>
+> **One attacker, one broken string, your whole site offline.** That is a denial-of-service attack that costs the attacker a single command — and it's exactly what Day 1's server was vulnerable to. **Two lines** of `try/catch` is the entire fix.
+>
+> ---
+>
+> **So what does the actual human see?**
+>
+> Never the words "Invalid JSON". That message is for a *developer*. The frontend catches the 400 and translates:
+>
+> | Layer | What it says |
+> |---|---|
+> | 🖥️ **Backend** | `400` · `{"error": "Invalid JSON"}` |
+> | ⚛️ **Frontend** | sees status `400`, picks a human message |
+> | 👤 **User** | *"Something went wrong sending your details. Check your connection and try again."* |
+>
+> Same rule as the byte-length error above: **API errors are written for developers; UI errors are written for humans.** And a real user hits this almost exclusively through cause ②, where "check your connection" happens to be exactly the right advice.
+>
+> ---
+>
+> > [!CAUTION]
+> > **The twist that should bother you: valid JSON is not the same as safe JSON.**
+> >
+> > `JSON.parse` only checks *grammar*, never *meaning*. This is perfectly valid JSON — same key twice:
+> >
+> > ```bash
+> > curl -X POST http://localhost:3000/register \
+> >      -H "Content-Type: application/json" \
+> >      -d '{"username":"alice","password":"longenough123","username":"admin"}'
+> > ```
+> >
+> > It parses without complaint. JavaScript keeps the **last** value, so `username` is `"admin"`:
+> >
+> > ```txt
+> > {"message":"User registered successfully"}
+> >
+> > $ curl localhost:3000/debug-db
+> > { "database": { "admin": { "cost": 12, ... } } }      ← not alice
+> > ```
+> >
+> > I ran that against this exact server. I asked for `alice` and created `admin`.
+> >
+> > Now imagine a gateway that validates the *first* `username` and a backend that stores the **last** one — different languages genuinely disagree here (Python keeps the last, Go keeps the last, some parsers keep the first, some reject outright). That mismatch is a real, named class of auth bypass: **JSON interoperability attacks.**
+> >
+> > `try/catch` gets you past "is this parseable". **Validating what's inside is a separate job, and it's the one that actually protects you.** We only check `!username || !password` today, which is nowhere near enough — schema validation is coming later in this series.
+
+---
+
+### The decoy hash — the line that looks like dead code
 
 ```js
 const DUMMY_HASH = bcrypt.hashSync("a-password-nobody-will-ever-use", SALT_ROUNDS);
@@ -697,7 +873,11 @@ There's a full walkthrough with measured numbers in [the enumeration section bel
 
 ---
 
-### `usersDB["legacy_user"] = { hash: bcrypt.hashSync("oldpassword123", 10) }`
+### The seeded legacy account
+
+```js
+usersDB["legacy_user"] = { hash: bcrypt.hashSync("oldpassword123", 10) };
+```
 
 A fake account, deliberately hashed at the **old cost of 10** while the rest of the app uses 12.
 
@@ -717,7 +897,13 @@ That's the whole migration strategy, in three lines. Full explanation in [the up
 
 ---
 
-### `Buffer.byteLength(password, "utf8") > 72`
+### Counting bytes instead of characters
+
+```js
+if (Buffer.byteLength(password, "utf8") > MAX_PASSWORD_BYTES) {
+  return sendJSON(res, 400, { error: `Password must be at most ${MAX_PASSWORD_BYTES} bytes` });
+}
+```
 
 Two things to unpack: what `Buffer` is, and why we count **bytes** instead of using `.length`.
 
@@ -767,7 +953,11 @@ Checking `password.length` would have let that straight through. `Buffer.byteLen
 
 ---
 
-### `const server = http.createServer(async (req, res) => {`
+### The one word that changed on the handler
+
+```js
+const server = http.createServer(async (req, res) => {
+```
 
 Spot the `async`. Day 1's handler was a plain function.
 
@@ -775,9 +965,13 @@ It's `async` because hashing takes ~244ms and we must `await` it. Without `async
 
 ---
 
-### `await bcrypt.hash(password, SALT_ROUNDS)`
+### Hashing — the one line Day 2 exists for
 
-The one line Day 2 exists for. Internally it:
+```js
+const hash = await bcrypt.hash(password, SALT_ROUNDS);
+```
+
+Internally it:
 
 1. Generates **16 random bytes** of salt
 2. Mixes salt + password
@@ -788,9 +982,13 @@ You never create, store, or manage the salt yourself. It's inside the returned s
 
 ---
 
-### `await bcrypt.compare(password, user.hash)`
+### Verifying — the mirror image
 
-The mirror image, and it's smarter than it looks. It does **not** "decrypt" anything — there's nothing to decrypt. It:
+```js
+const ok = await bcrypt.compare(password, user.hash);
+```
+
+It's smarter than it looks. It does **not** "decrypt" anything — there's nothing to decrypt. It:
 
 1. **Reads the cost** (`12`) out of the stored string
 2. **Reads the 22-character salt** out of the stored string
@@ -803,17 +1001,15 @@ The mirror image, and it's smarter than it looks. It does **not** "decrypt" anyt
 
 ---
 
-### `catch (err) { ... }` — two kinds of failure, two kinds of answer
+### The catch block — two kinds of failure, two kinds of answer
 
 ```js
 } catch (err) {
-  const bad = err.message === "Invalid JSON";
-
-  if (bad) {
+  if (err.message === "Invalid JSON") {
     return sendJSON(res, 400, { error: "Invalid JSON" });
   }
 
-  console.error("[ERROR] /login failed:", err);        // developer sees everything
+  console.error("[ERROR] /login failed:", err);                   // developer sees everything
   return sendJSON(res, 500, { error: "Internal server error" });  // user sees nothing
 }
 ```
@@ -1019,11 +1215,29 @@ The server log prints `[UPGRADE] legacy_user: cost 10 → 12`. Check `/debug-db`
 node test-work-factors.js
 ```
 
-**6. Send garbage and confirm the server survives** (Day 1's died here):
+**6. Be the attacker — bypass your own frontend.** Every one of these skips the browser entirely, and the server survives all of them. Day 1's server **died** on the first one:
 
 ```bash
 curl -X POST localhost:3000/login -H "Content-Type: application/json" -d 'hello'
+
+curl -X POST localhost:3000/login                     # no body at all
+
+curl -X POST localhost:3000/register -H "Content-Type: application/json" \
+  -d '{"username": "hacker", "password": '            # cut off mid-sentence
 ```
+
+All three return `400 {"error":"Invalid JSON"}` and the process stays up. **That's the `try/catch` earning its place.**
+
+**7. Now prove that valid JSON still isn't safe:**
+
+```bash
+curl -X POST localhost:3000/register -H "Content-Type: application/json" \
+  -d '{"username":"alice","password":"longenough123","username":"admin"}'
+
+curl localhost:3000/debug-db
+```
+
+You asked for `alice`. Check the database — you created **`admin`**. Parsing succeeded; that was never the same thing as being safe.
 
 ---
 
@@ -1044,6 +1258,9 @@ curl -X POST localhost:3000/login -H "Content-Type: application/json" -d 'hello'
 | **Timing attacks** | `===` short-circuits and leaks. `bcrypt.compare` is constant-time. |
 | **Username enumeration** | Same message isn't enough — **the response time has to match too.** |
 | **72-byte truncation** | bcrypt ignores the rest, silently. Reject long passwords instead. |
+| **Frontend validation isn't security** | `curl` skips it entirely. Every rule has to exist on the server too. |
+| **`try/catch` on `JSON.parse`** | One malformed body with no catch = the whole process exits. |
+| **Valid ≠ safe** | Parsing checks grammar, never meaning. Schema validation is a separate job. |
 
 ---
 
@@ -1055,6 +1272,8 @@ curl -X POST localhost:3000/login -H "Content-Type: application/json" -d 'hello'
 4. An attacker reads `$2b$14$...` and now knows your work factor. Explain why you don't care.
 5. Both wrong-username and wrong-password return `401 Invalid credentials`. **Describe how an attacker still works out which emails have accounts.**
 6. Why can't you just loop over your database and re-hash everyone at cost 14 tonight?
+7. Your frontend already blocks empty passwords and short ones. Why does the server check again anyway?
+8. A request body arrives as `{"username":"alice","username":"admin"}`. Does `JSON.parse` complain — and which user gets created?
 
 If #5 came to you instantly, you're already thinking one level above most working developers.
 

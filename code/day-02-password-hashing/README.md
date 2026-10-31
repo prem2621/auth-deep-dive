@@ -82,12 +82,33 @@ Rejected with a clear 400. Without this guard, bcrypt would have ignored everyth
 
 ### 7. Garbage no longer kills the server
 
+Every one of these bypasses a browser completely — which is exactly how a real attacker reaches you:
+
 ```bash
 curl -X POST localhost:3000/login -H "Content-Type: application/json" -d 'hello'
-curl localhost:3000/debug-db     # still alive
+
+curl -X POST localhost:3000/login                    # no body at all
+
+curl -X POST localhost:3000/register -H "Content-Type: application/json" \
+  -d '{"username": "hacker", "password": '           # cut off mid-sentence
+
+curl localhost:3000/debug-db                         # still alive
 ```
 
-Day 1's server died on this. Now it returns a clean 400.
+All return a clean `400 {"error":"Invalid JSON"}`. **Day 1's server died on the first one** — a single malformed string took the whole process down.
+
+### 8. 🪤 Valid JSON is still not safe JSON
+
+```bash
+curl -X POST localhost:3000/register -H "Content-Type: application/json" \
+  -d '{"username":"alice","password":"longenough123","username":"admin"}'
+
+curl localhost:3000/debug-db
+```
+
+Duplicate key — and it's **perfectly valid JSON**, so `JSON.parse` accepts it happily. JavaScript keeps the *last* value. You asked to create `alice`; look in the database and you created **`admin`**.
+
+`try/catch` only answers "can this be parsed". Validating what's *inside* is a separate job — and the one that actually protects you.
 
 ## Still broken (on purpose)
 
