@@ -502,8 +502,10 @@ const server = http.createServer(async (req, res) => {
 
       return sendJSON(res, 201, { message: "User registered successfully" });
     } catch (err) {
-      const bad = err.message === "Invalid JSON";
-      return sendJSON(res, bad ? 400 : 500, { error: bad ? "Invalid JSON" : "Internal server error" });
+      if (err.message === "Invalid JSON")
+        return sendJSON(res, 400, { error: "Invalid JSON" });
+      console.error("[ERROR] /register failed:", err);   // full detail for us
+      return sendJSON(res, 500, { error: "Internal server error" }); // vague for them
     }
   }
 
@@ -532,8 +534,10 @@ const server = http.createServer(async (req, res) => {
 
       return sendJSON(res, 200, { message: `Welcome ${username}! Password verified.` });
     } catch (err) {
-      const bad = err.message === "Invalid JSON";
-      return sendJSON(res, bad ? 400 : 500, { error: bad ? "Invalid JSON" : "Internal server error" });
+      if (err.message === "Invalid JSON")
+        return sendJSON(res, 400, { error: "Invalid JSON" });
+      console.error("[ERROR] /login failed:", err);
+      return sendJSON(res, 500, { error: "Internal server error" });
     }
   }
 
@@ -554,6 +558,13 @@ server.listen(3000, () => console.log("🔐 Day 2 server on http://localhost:300
 ## 🔬 Line by line — the parts that are new since Day 1
 
 Day 1 covered `require`, `createServer`, `req`/`res`, streams, chunks, `JSON.parse`, `res.end`. Those work identically here. **These are the genuinely new pieces.**
+
+> [!TIP]
+> **If any part of this feels heavy — don't worry. I had exactly the same questions.**
+>
+> Every `🙋 WAIT —` block below is a question that genuinely stopped me while writing this code. *Why two error handlers? Aren't `reject` and `catch` the same thing? Why count bytes instead of characters?* I didn't get Promises, streams or error handling on the first pass either — so I've written every one of those answers out below, in the order they hit me.
+>
+> Read it once for the shape, run the code, then come back. The second pass is where it clicks. That's how it went for me, and there's nothing wrong with you if it goes the same way.
 
 ---
 
@@ -585,10 +596,174 @@ const { username, password } = await parseBody(req);
 
 Flat, readable, and errors land in a normal `try/catch`. **The mechanics underneath are byte-for-byte identical** — still a stream, still chunks, still `.toString()`. We only changed how we *wait* for it.
 
-`resolve` = "success, here's the value." `reject` = "it failed, here's why." That's a Promise.
+`resolve` = "success, here's the value." `reject` = "it failed, here's why." That's a Promise in one line.
 
 > [!NOTE]
 > Notice the `catch { reject(...) }` around `JSON.parse`. **This is the Day 1 crash bug, fixed.** Yesterday, sending `hello` to `/login` killed the entire process. Now it returns a clean 400.
+
+---
+
+> ### 🙋 WAIT — why `req.on("error", reject)`? The `try/catch` already catches errors.
+>
+> Genuinely sharp question, and the answer is that **those two lines catch two completely different failures that happen at two different moments.**
+>
+> ```js
+> req.on("end", () => {
+>   try { resolve(JSON.parse(body)); }
+>   catch { reject(new Error("Invalid JSON")); }   // ← failure type 1
+> });
+>
+> req.on("error", reject);                          // ← failure type 2
+> ```
+>
+> | | `try/catch` around `JSON.parse` | `req.on("error", reject)` |
+> |---|---|---|
+> | **Catches** | Bad *data* — all of it arrived, but it isn't valid JSON (`{"name": "John"` with no closing brace) | Bad *connection* — the data never finished arriving |
+> | **When** | **After** the request completed, inside `"end"` | **During** transmission, before `"end"` ever fires |
+> | **Real cause** | User/client sent malformed JSON | Wi-Fi dropped, browser tab closed mid-upload, cable yanked |
+>
+> **Here's the killer detail: a stream error never reaches your `try/catch`.** It's not an exception being thrown down the call stack — it's an **event** being emitted on the stream object. Your `try/catch` sits *inside* the `"end"` callback, and when the network dies, `"end"` **never fires at all**. The catch block is never even reached.
+>
+> **So what happens if you delete that line?** Follow it through:
+>
+> ```txt
+> 1. User's internet cuts out halfway through the upload
+> 2. "end" never fires       →  your try/catch never runs
+> 3. The stream emits "error" →  nobody is listening
+> 4. Your Promise never resolves AND never rejects
+>    →  it hangs pending forever  →  the memory it holds is never freed
+> 5. In Node, an unhandled stream "error" event is thrown as an
+>    uncaught exception  →  it can take the whole server down
+> ```
+>
+> One dropped connection shouldn't be able to leak memory or kill your process. That one line is what prevents it.
+>
+> > [!NOTE]
+> > This is a general rule in Node, not a bcrypt thing: **every stream you listen to needs an `"error"` listener.** Request bodies, file reads, database cursors, network sockets — all of them. An unhandled `"error"` event is one of the most common ways a Node server dies in production.
+
+---
+
+> ### 🙋 WAIT — if we have `resolve`/`reject`, why do we *also* need `try/catch`? Aren't they the same?
+>
+> They feel like the same thing because both deal with failure. But they sit on **opposite sides of the transaction**.
+>
+> | | `resolve` / `reject` | `try` / `catch` |
+> |---|---|---|
+> | **Role** | **Producer** — decides the outcome | **Consumer** — deals with the outcome |
+> | **Lives** | inside `new Promise(...)` | inside the `async` function that `await`s it |
+> | **Kitchen analogy** | The chef deciding "dish is ready" or "dish is ruined" | The customer at the table handling a ruined dish |
+>
+> `reject` **throws the ball. `catch` is the glove.** You need both, or the ball hits the floor.
+>
+> **And "hits the floor" is not a metaphor.** If a Promise rejects and nothing is there to catch it — no `try/catch` around the `await`, no `.catch()` chained on — Node raises an **unhandled promise rejection**. In modern Node that terminates the process by default. Your entire server goes down because one user sent a malformed request body.
+>
+> **So should you wrap every Promise in `try/catch`?** No — that's how you end up with "try/catch hell", nested blocks everywhere, unreadable. Use one when:
+>
+> - ✅ You're using `async`/`await` and want flat, readable error handling
+> - ✅ You can actually **do something** about the failure right there — send a 400, show a fallback, retry
+> - ❌ Not when you'd just re-throw it unchanged. Let it bubble up to a caller that *can* handle it.
+>
+> In our server each route handler has exactly one `try/catch` wrapping everything, because each route has exactly one meaningful recovery: send an error response instead of a success one. One handler, one catch. That's the right amount.
+
+---
+
+### `const DUMMY_HASH = bcrypt.hashSync(...)`
+
+```js
+const DUMMY_HASH = bcrypt.hashSync("a-password-nobody-will-ever-use", SALT_ROUNDS);
+```
+
+This line looks pointless — we hash a password nobody will ever type and never use the result to log anyone in. **It is one of the two most important lines in the file.**
+
+It exists to make a *non-existent* user cost exactly as much CPU time as a real one.
+
+```js
+const user = usersDB[username];
+
+if (!user) {
+  await bcrypt.compare(password, DUMMY_HASH);   // burn the same ~244ms
+  return sendJSON(res, 401, { error: "Invalid credentials" });
+}
+```
+
+Without it, an unknown username returns in ~0ms while a real one takes ~244ms, and that gap tells an attacker **exactly which accounts exist on your platform.** They never need to guess a password to get value out of your login endpoint.
+
+There's a full walkthrough with measured numbers in [the enumeration section below](#️-username-enumeration--the-leak-hiding-in-plain-sight) — including why 228ms is an enormous signal rather than a subtle one.
+
+> [!NOTE]
+> **Why `hashSync` here but `await bcrypt.compare` everywhere else?**
+> `hashSync` **blocks the entire Node process** while it runs. That is unacceptable inside a request handler — one login would freeze every other user's request for 244ms. But this line runs **once, at startup**, before the server accepts any traffic. Blocking for a quarter second there costs nothing. Same reasoning for the seeded legacy account below.
+> **Rule: `*Sync` at startup is fine. `*Sync` inside a request handler is a performance bug.**
+
+---
+
+### `usersDB["legacy_user"] = { hash: bcrypt.hashSync("oldpassword123", 10) }`
+
+A fake account, deliberately hashed at the **old cost of 10** while the rest of the app uses 12.
+
+It's there so you can watch a real production problem solve itself in front of you: **how do you strengthen your hashing years after launch, when you don't know anybody's password?**
+
+You can't loop over the database and re-hash — hashing is one-way, you have nothing to re-hash *from*. The only moment the plaintext password exists anywhere in your system is **the instant a user types it to log in.** So you upgrade right then:
+
+```js
+if (bcrypt.getRounds(user.hash) < SALT_ROUNDS) {
+  user.hash = await bcrypt.hash(password, SALT_ROUNDS);
+}
+```
+
+Log in as `legacy_user` / `oldpassword123` and the server prints `[UPGRADE] legacy_user: cost 10 → 12`. Check `/debug-db` before and after — the stored string changes from `$2b$10$` to `$2b$12$`, and the user never noticed a thing.
+
+That's the whole migration strategy, in three lines. Full explanation in [the upgrade section above](#-raising-your-work-factor-years-later-without-breaking-logins).
+
+---
+
+### `Buffer.byteLength(password, "utf8") > 72`
+
+Two things to unpack: what `Buffer` is, and why we count **bytes** instead of using `.length`.
+
+**`Buffer` is built into Node and globally available** — no `require` needed, like `console` or `process`. It represents **raw binary data**: the actual sequence of bytes, as the computer stores it.
+
+You typed letters. The computer stores bytes. Those are not the same count:
+
+| Character | `.length` says | Actual bytes |
+|---|:---:|:---:|
+| `a` `b` `1` `2` | 1 each | **1** each |
+| `ñ` `ü` | 1 each | **2** each |
+| `汉` | 1 | **3** |
+| `😀` `🔥` | 2 each (!) | **4** each |
+
+**Why this matters enormously here:** bcrypt ignores everything past the first **72 bytes**. Not characters — bytes. So:
+
+```txt
+A user picks a 50-emoji password.
+password.length      →  100   ("looks fine, under 72? no — but close")
+Buffer.byteLength()  →  200   (50 × 4 bytes)
+
+bcrypt silently keeps the first 72 bytes and throws 128 bytes away.
+The user can now log in by typing only the first ~18 emojis.
+The rest of their password does nothing. They will never know.
+```
+
+Checking `password.length` would have let that straight through. `Buffer.byteLength()` catches it.
+
+> [!IMPORTANT]
+> **"But a normal user has no idea what a byte is!"** — completely right, and this is worth understanding properly.
+>
+> This server is a **backend API**. Its error messages are for the *frontend*, not the human. In a real product the frontend handles it in one of two ways:
+>
+> **1. Prevent it** (what most teams do): set `maxlength="72"` on the password input. Since 72 characters is the *worst* case only when every character is 4 bytes, ordinary passwords never come near the limit.
+>
+> **2. Translate it:** intercept the 400 and rewrite it in human language.
+>
+> ```js
+> catch (error) {
+>   if (error.response.data.error.includes("bytes")) {
+>     showNotification("That password is too long. Try shortening it or using fewer special characters.");
+>   }
+> }
+> ```
+>
+> **The general principle, and it's a big one: API errors are written for developers; UI errors are written for humans.** Never show a raw backend message directly to a user.
 
 ---
 
@@ -625,6 +800,62 @@ The mirror image, and it's smarter than it looks. It does **not** "decrypt" anyt
 
 > [!IMPORTANT]
 > Step 4 is the one most people skip past. It is **not** doing `===`. Read on.
+
+---
+
+### `catch (err) { ... }` — two kinds of failure, two kinds of answer
+
+```js
+} catch (err) {
+  const bad = err.message === "Invalid JSON";
+
+  if (bad) {
+    return sendJSON(res, 400, { error: "Invalid JSON" });
+  }
+
+  console.error("[ERROR] /login failed:", err);        // developer sees everything
+  return sendJSON(res, 500, { error: "Internal server error" });  // user sees nothing
+}
+```
+
+**First: is `err` a JavaScript keyword?** No. `try` and `catch` are keywords — `err` is just a **variable name you picked**. When something throws, JavaScript creates an **Error object** and hands it to whatever name you put in the parentheses. You could write `catch (myBanana)` and it would work identically. The convention is `err` or `error`; that's all it is.
+
+Every Error object carries a `.message` property — plain text describing what went wrong. Our `parseBody` rejects with `new Error("Invalid JSON")`, so `err.message === "Invalid JSON"` is just asking *"was this the failure I deliberately created, or something I didn't anticipate?"*
+
+**Why two different status codes?** Because they mean genuinely different things, and the distinction is for the *client*, not decoration:
+
+| | **400 Bad Request** | **500 Internal Server Error** |
+|---|---|---|
+| **Means** | "**You** sent something wrong." | "**We** broke. Not your fault." |
+| **Cause here** | Malformed JSON in the request body | Database down, bcrypt failed, a bug in our code |
+| **Can the caller fix it?** | Yes — fix the request and retry | No — retrying the same request changes nothing |
+
+**Now the part you pushed back on, and you were right to:** *"we need to know the exact error instead of swallowing it."*
+
+Correct — but the fix isn't to send the real error to the user. There are two different audiences, and they need opposite things:
+
+**👤 What the user sees — generic, always.** Suppose the database is unreachable and the raw error is:
+
+```txt
+Error: connect ECONNREFUSED 127.0.0.1:5432
+    at TCPConnectWrap.afterConnect [as oncomplete] (net.js:1148:16)
+```
+
+Ship that to the client and you've just told an attacker you run **PostgreSQL**, on the **default port**, on **localhost** — plus your file paths and framework internals. That's free reconnaissance. And a normal user can do nothing with it anyway.
+
+**🛠️ What the developer sees — everything.** You log the full error, with stack trace, to your terminal or logging service.
+
+```js
+console.error("[ERROR] /login failed:", err);
+```
+
+> [!WARNING]
+> **A bare `catch` with no logging is one of the worst habits in backend development.** Your server starts returning 500s, your users complain, and you have *nothing* — no message, no stack, no clue. The error happened and you threw away the only evidence.
+>
+> **Catch the error, log it fully, respond vaguely.** Never catch and stay silent.
+
+> [!NOTE]
+> In production you'd go one step further and attach a **request ID**: log `[req-a4f9c2] /login failed: <full error>` and respond `{"error": "Internal server error", "requestId": "a4f9c2"}`. Now the user can quote that ID in a support ticket and you can find the exact log line in seconds — without ever exposing what went wrong.
 
 ---
 
@@ -836,6 +1067,26 @@ The password problem is solved. **Day 1's problem is not.**
 Log in successfully today and the server knows exactly who you are — for about 3 milliseconds. Then the response ends, and the next request arrives as a total stranger. We proved on Day 1 that HTTP remembers nothing.
 
 Tomorrow: **Sessions** — the original answer. We build a complete session system from scratch in pure Node, no libraries: generating session IDs with real entropy (and why `Math.random()` is a genuine vulnerability), setting and reading cookies by hand, expiry, logout that actually logs out — and then we find exactly where sessions fall apart at scale.
+
+---
+
+## 🌱 This is open source — help make it better
+
+I'm writing these notes while learning, in the open, because this is the explanation **I wish I'd found** when I started. Not "call `bcrypt.hash()` and move on", but *why every line exists and what breaks without it*.
+
+We're all learning in an era where it's easy to get an answer and hard to get an understanding. These notes are my attempt at the second one — and they get better when other people push on them.
+
+**So please — fork it, open an issue, send a PR:**
+
+- 🐛 **Found a mistake?** Open an issue. I'd much rather be corrected in public than stay wrong in private.
+- 🤔 **Something unclear?** That's a bug in the writing, not a gap in you. Tell me which paragraph lost you and I'll rewrite it.
+- 💡 **Know a sharper analogy, a better diagram, or an attack I missed?** Send it. Especially if you've seen this stuff break in production.
+- 🌍 **Want to translate a day into your language?** Go for it. More beginners reached is the entire point.
+- ⭐ **Just learning along?** A star genuinely helps other beginners find it.
+
+No contribution is too small. Fixing one confusing sentence helps the next person who reads it at 11pm wondering if they're the only one who doesn't get Promises.
+
+> **You're not. I didn't either. That's why this repo exists.**
 
 ---
 

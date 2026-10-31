@@ -104,10 +104,18 @@ const server = http.createServer(async (req, res) => {
 
       return sendJSON(res, 201, { message: "User registered successfully" });
     } catch (err) {
-      const bad = err.message === "Invalid JSON";
-      return sendJSON(res, bad ? 400 : 500, {
-        error: bad ? "Invalid JSON" : "Internal server error",
-      });
+      // Two audiences, two different answers:
+      //   400 = "YOU sent something wrong"  (the caller can fix it)
+      //   500 = "WE broke"                  (the caller can do nothing)
+      if (err.message === "Invalid JSON") {
+        return sendJSON(res, 400, { error: "Invalid JSON" });
+      }
+      // ★ Log the FULL error for us, send a vague one to them.
+      //   Never catch an error and stay silent — you throw away the only
+      //   evidence you'll ever have. And never ship the raw message to the
+      //   client: it hands an attacker a map of your infrastructure.
+      console.error("[ERROR] /register failed:", err);
+      return sendJSON(res, 500, { error: "Internal server error" });
     }
   }
 
@@ -157,10 +165,11 @@ const server = http.createServer(async (req, res) => {
         note: "The next request still won't know who you are. That's Day 3.",
       });
     } catch (err) {
-      const bad = err.message === "Invalid JSON";
-      return sendJSON(res, bad ? 400 : 500, {
-        error: bad ? "Invalid JSON" : "Internal server error",
-      });
+      if (err.message === "Invalid JSON") {
+        return sendJSON(res, 400, { error: "Invalid JSON" });
+      }
+      console.error("[ERROR] /login failed:", err);
+      return sendJSON(res, 500, { error: "Internal server error" });
     }
   }
 

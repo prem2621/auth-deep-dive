@@ -102,9 +102,23 @@ If a note in this repo doesn't answer both, it isn't finished yet.
 
 ---
 
-## 🤝 Found an error? Disagree with something?
+## 🌱 This is open source — help make it better
 
-Open an issue. Being corrected in public is faster than being wrong in private.
+I'm writing these notes while learning, in the open, because this is the explanation **I wish I'd found** when I started. Not "call `bcrypt.hash()` and move on", but *why every line exists and what breaks without it*.
+
+We're all learning in an era where it's easy to get an answer and hard to get an understanding. These notes are my attempt at the second one — and they get better when other people push on them.
+
+| | |
+|---|---|
+| 🐛 **Found a mistake?** | Open an issue. I'd much rather be corrected in public than stay wrong in private. |
+| 🤔 **Something unclear?** | That's a bug in the writing, not a gap in you. Tell me which paragraph lost you. |
+| 💡 **Better analogy or diagram?** | Send a PR. Especially if you've seen this break in production. |
+| 🌍 **Want to translate a day?** | Go for it. More beginners reached is the entire point. |
+| ⭐ **Just learning along?** | A star genuinely helps other beginners find it. |
+
+No contribution is too small. Fixing one confusing sentence helps the next person reading it at 11pm wondering if they're the only one who doesn't get Promises.
+
+**You're not. I didn't either. That's why this repo exists.**
 
 ---
 
