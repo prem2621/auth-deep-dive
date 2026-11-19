@@ -873,15 +873,6 @@ There's a full walkthrough with measured numbers in [the enumeration section bel
 
 When you call bcrypt.hashSync(), you are telling Node.js: "Drop everything, use 100% of your brainpower to crunch this heavy math, and do not move to the next line of code until you are completely finished.
 
-### Why does it "stop" the server? (The Single-Thread Problem)
-Unlike some other programming languages that create a separate worker for every single user, Node.js uses one main worker (the Event Loop) to handle all incoming requests from all users.
-
-Think of Node.js like a **single cashier** at a busy coffee shop:
-**Synchronous (hashSync) = Blocking the line:**
-Imagine User A orders a complicated drink (hashing a password) that takes 244ms to make. With hashSync, the cashier walks away from the register, makes the drink themselves from start to finish, and refuses to even say "hello" to User B or User C until User A's drink is done. If 10 people try to log in at the exact same time, the 10th person has to wait 10 × 244ms = 2.44 seconds just for the server to acknowledge them. Everything stops.
-**Asynchronous (await bcrypt.compare / await bcrypt.hash) = Non-blocking:**
-With await, the cashier takes User A's order, hands it off to a background kitchen helper (Node's C++ worker threads), and immediately turns to User B to take their order. While the background helpers crunch the heavy math for User A and User B simultaneously, the main cashier is completely free to keep serving User C, User D, and loading pages for everyone else. When the kitchen helper finishes User A's math, it taps the cashier on the shoulder (await resolves) to hand the result back.
-
 ---
 
 ### The seeded legacy account
