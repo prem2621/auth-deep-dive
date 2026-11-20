@@ -1505,3 +1505,343 @@ setInterval(() => {
 > [!NOTE]
 > Redis does this job for you: give a key an expiry (`EXPIRE`) and Redis deletes it on its own. That's one of several reasons it became the default home for sessions.
 
+---
+
+## 🧪 Run it and watch it happen
+
+```bash
+cd code/day-03-sessions
+npm install
+node server.js
+```
+
+Open a **second** terminal for the commands. curl's `-c file` *saves* cookies the server sets, and `-b file` *sends* them back, so a file acts like one browser's cookie storage.
+
+**1. Log in and see the cookie being born:**
+
+```bash
+curl -X POST localhost:3000/register -H "Content-Type: application/json" \
+  -d '{"username":"alice","password":"mypassword123"}'
+
+curl -i -X POST localhost:3000/login -H "Content-Type: application/json" \
+  -d '{"username":"alice","password":"mypassword123"}' -c laptop.txt
+```
+
+`-i` prints the response headers. Find the `Set-Cookie` line and read each flag.
+
+**2. Be remembered, then be a stranger:**
+
+```bash
+curl localhost:3000/profile -b laptop.txt     # 200: it knows you're alice
+curl localhost:3000/profile                   # 401: no cookie, no idea who you are
+```
+
+That first line is **Day 1's problem, solved.** No password in that request. Just a key card.
+
+**3. Steal the session store, try to use it:**
+
+```bash
+curl localhost:3000/debug
+```
+
+Copy the `storedKey` and send it as if it were a cookie:
+
+```bash
+curl localhost:3000/profile -H "Cookie: sid=PASTE_STORED_KEY_HERE"     # 401
+```
+
+Then compare it with the value in `laptop.txt`. Completely different. The store holds only hashes.
+
+**4. Be the thief — then lock the thief out:**
+
+```bash
+# a second device logs in
+curl -X POST localhost:3000/login -H "Content-Type: application/json" -A "Phone/1.0" \
+  -d '{"username":"alice","password":"mypassword123"}' -c phone.txt
+
+curl localhost:3000/sessions -b laptop.txt    # two devices listed
+
+# the attacker uses a copy of the laptop's cookie (copy the value from laptop.txt)
+curl localhost:3000/profile -A "EvilBox/6.6" -H "Cookie: sid=PASTE_LAPTOP_COOKIE"   # 200 😱
+
+curl -X POST localhost:3000/logout-all -b phone.txt
+
+curl localhost:3000/profile -H "Cookie: sid=PASTE_LAPTOP_COOKIE"   # 401 ✅
+```
+
+**5. The deactivated key card** (the most important one to watch):
+
+```bash
+curl -X POST localhost:3000/login -H "Content-Type: application/json" \
+  -d '{"username":"alice","password":"mypassword123"}' -c laptop.txt
+curl -X POST localhost:3000/logout -b laptop.txt
+curl localhost:3000/profile -b laptop.txt       # 401
+```
+
+Open `laptop.txt`. **The cookie is still in there**, and curl just sent it. (We used `-b` without `-c`, so curl never updated the file. That's exactly the situation of a thief holding an old copy.) The key still exists. The hotel deactivated it.
+
+**6. Watch the idle clock run out.** Stop the server and restart it with a 10-second idle timeout:
+
+```bash
+IDLE_TIMEOUT_MS=10000 node server.js            # bash / Git Bash
+$env:IDLE_TIMEOUT_MS=10000; node server.js      # PowerShell
+```
+
+Log in, call `/profile` a few times within 10 seconds (all 200), then wait 11 seconds and call it again: **401**, with the cookie still sitting in your jar.
+
+**7. Run the fixation attack yourself:**
+
+```bash
+# attacker gets a guest session
+curl -X POST localhost:3000/cart -H "Content-Type: application/json" \
+  -d '{"item":"bait"}' -c attacker.txt
+
+# copy the sid value from attacker.txt, then the "victim" logs in carrying it
+curl -i -X POST localhost:3000/login -H "Content-Type: application/json" \
+  -H "Cookie: sid=PASTE_ATTACKER_SID" \
+  -d '{"username":"alice","password":"mypassword123"}'
+
+# attacker checks whether they got in
+curl localhost:3000/profile -b attacker.txt       # 401: the fix worked
+```
+
+Now **break it on purpose.** In `server.js`, inside `/login`, find these three lines:
+
+```js
+const current = getSession(req);
+const cart = current ? current.record.cart : [];
+if (current) sessions.delete(current.key);
+```
+
+and replace them with:
+
+```js
+const current = getSession(req);
+if (current) {
+  current.record.username = username;    // ❌ promote the old ID
+  return sendJSON(res, 200, { message: `Welcome ${username}!` });
+}
+const cart = [];
+```
+
+Restart, run the same three commands, and the attacker's last call returns **alice's profile**. Put the original lines back.
+
+**8. Try to crash it the way the first draft crashed:**
+
+```bash
+curl localhost:3000/profile -H "Cookie: sid=constructor"
+curl localhost:3000/profile -H "Cookie: sid=__proto__"
+curl -X POST localhost:3000/login -H "Content-Type: application/json" -d 'null'
+curl localhost:3000/debug        # still alive
+```
+
+**9. Restart the server, then try your cookie again:**
+
+```bash
+curl localhost:3000/profile -b laptop.txt     # 401, everyone is logged out
+```
+
+That's the cliffhanger for the next section.
+
+**10. In a real browser — see `HttpOnly` with your own eyes.** Open `http://localhost:3000/profile` in Chrome or Firefox, press **F12**, go to the **Console** tab and paste:
+
+```js
+await fetch("/register", { method: "POST", body: JSON.stringify({ username: "web", password: "mypassword123" }) });
+await fetch("/login",    { method: "POST", body: JSON.stringify({ username: "web", password: "mypassword123" }) });
+document.cookie
+```
+
+Then refresh the page: it now shows your profile, because the browser stored the cookie and sends it automatically. But `document.cookie` doesn't show `sid`, because it's `HttpOnly`. Now open the **Application** (Chrome) or **Storage** (Firefox) tab → **Cookies**: the cookie is right there, with its `HttpOnly` and `Secure` boxes ticked. **The browser has it. Page JavaScript can't touch it.**
+
+---
+
+## 🏗️ Where sessions break — the scale problem
+
+Exercise 9 showed it in one line:
+
+> 🧪 **PROVEN ON MY MACHINE**
+>
+> ```txt
+> before restart  →  GET /profile  →  HTTP 200
+> (restart the server)
+> after restart   →  GET /profile  →  HTTP 401  { "error": "Not logged in" }
+> ```
+
+Our sessions live in a `Map`, in this **one process's memory**. Restart it (a deploy, a crash, a cloud machine being replaced) and **every user is logged out at once.**
+
+It gets worse when you grow. One server can't handle a million users, so you run several, with a **load balancer** in front sharing requests between them:
+
+```txt
+alice logs in        →  load balancer  →  Server A   (session saved in A's memory)
+alice's next click   →  load balancer  →  Server B   (B has never heard of it)  →  401
+```
+
+Alice is randomly logged out, logs in again, gets logged out again two clicks later, and files a support ticket.
+
+**The hotel version:** the hotel has grown into a chain with three buildings, and each building's reception keeps its *own* guest list. Your card was activated in building A. The gym is in building B. It doesn't recognise you.
+
+There are three standard fixes, each with a cost:
+
+| Fix | How it works | Cost |
+|---|---|---|
+| **Sticky sessions** | The load balancer always sends alice to the same server | That server dies or restarts → its users are all logged out. Load spreads unevenly. |
+| **Shared session store** (Redis, Memcached) | Every server reads and writes sessions in one fast, central place | One more thing to run, secure, and keep alive. If it goes down, nobody can log in. |
+| **Database table** | Sessions as rows in the database you already have | Simplest to run. One extra query per request, which is fine for many apps. |
+
+```mermaid
+flowchart LR
+    LB["⚖️ Load balancer"] --> A["Server A"]
+    LB --> B["Server B"]
+    LB --> C["Server C"]
+    A --> R[("🗄️ Shared session store<br/>Redis / database")]
+    B --> R
+    C --> R
+```
+
+With a shared store, a session created by Server A can be read by B and C, and a server can restart without logging anyone out. This is what `express-session` with a Redis store does in production. And the code barely changes: `sessions.get(key)` becomes `await redis.get(key)`. Everything else on this page — the random IDs, the hashing, the flags, the timeouts, fixation — stays exactly the same.
+
+There's also a fourth idea: **what if the server didn't need to look anything up at all?** What if the cookie itself carried "this is alice", with a tamper-proof seal the server could check? That idea has a name, and it's tomorrow's topic.
+
+---
+
+## 🧭 "Sessions are old. JWT is the modern way." — is that true?
+
+You'll hear this constantly. It's **not true**, and believing it causes real security problems. Let's sort it out properly.
+
+**Sessions are not legacy. They're everywhere, right now:**
+
+- **Django** stores sessions server-side in the database by default
+- **PHP's** built-in `session_start()` stores sessions on the server
+- **Laravel, Spring Session, `express-session`**: all server-side session systems, actively used in new projects
+- **GitHub**: open DevTools on github.com while logged in and you'll find a session cookie named `user_session`
+- Most online banking and healthcare web apps, where instant revocation isn't optional
+
+And many systems that *say* they use tokens still keep server-side state, usually a list of **refresh tokens** that can be revoked. That list is a session store by another name.
+
+### What a JWT actually changes
+
+Back to the hotel. A session is a **key card**: meaningless by itself, and the hotel's computer has to look it up every time.
+
+A JWT is an **all-inclusive resort wristband**: your name and room are printed on it, sealed with the resort's tamper-proof stamp. Staff anywhere can check the seal and serve you **without calling reception.** That's fast, and it works even if reception's computer is down.
+
+But think about the wristband's weaknesses:
+
+- **The resort can't take it back.** It's on your wrist until it expires. Report it stolen and the thief can still use it until the end date.
+- **Whatever's printed on it stays printed.** Get downgraded from "VIP" to "regular" and the wristband still says VIP until it expires.
+- **Anyone can read it.** The seal stops changes, not reading.
+
+### The honest comparison
+
+| | Sessions | JWT (stateless token) |
+|---|---|---|
+| **Where the truth lives** | Server (the store) | Inside the token itself |
+| **Log out / revoke instantly** | ✅ Delete the row | ❌ Valid until it expires, unless you keep a server-side blocklist, **which is a session store again** |
+| **"Log out of all devices"** | ✅ Today's `/logout-all` | ❌ Hard, for the same reason |
+| **Role changes take effect** | ✅ Next request | ⚠️ When the token expires |
+| **Many servers / services** | ⚠️ Needs a shared store | ✅ Any service holding the key can verify it |
+| **If the central store goes down** | ❌ Nobody can log in | ✅ Unaffected, but the **signing key** becomes the single thing that must never leak |
+| **Size of what's sent per request** | ~64 characters | Often hundreds of characters |
+
+Neither one is "better". **They put the truth in different places, and that decides everything else.** There's a well-known 2016 article titled *"Stop using JWT for sessions"* that's still widely shared today, and it makes exactly this point: most web apps that adopt JWT end up rebuilding sessions badly.
+
+### How to choose
+
+| You're building... | Use |
+|---|---|
+| A website where users log in through a browser (most apps) | **Sessions.** Simple, revocable, battle-tested. |
+| Hospital records, banking, admin panels: anywhere *"kill this login now"* must work instantly | **Sessions**, with short timeouts |
+| Many separate services or APIs that each need to verify a user without calling home | **Short-lived tokens** (minutes), with a **server-side refresh token** that *can* be revoked |
+| A mobile app talking to your API | Usually the same hybrid: short access token + revocable refresh token |
+
+Notice the last two rows. Even the token-based designs keep **something** on the server that can be killed. The modern answer isn't "JWT instead of sessions". It's **"know exactly where your truth lives, and make sure you can always revoke it."**
+
+---
+
+## 🚧 What today's server still doesn't do (on purpose)
+
+| Gap | Why it matters | Where it gets fixed |
+|---|---|---|
+| **Sessions live in one process's memory** | Restart = everyone logged out; can't run two servers | The shared-store pattern above, later in this series |
+| **No rate limiting on `/login`** | Anyone can try thousands of passwords per minute. bcrypt makes each guess slow, but doesn't cap how many they make. | Rate limiting and lockout, later in this series |
+| **CSRF is only partly covered** | `SameSite=Lax` blocks the classic attack, but real apps add more layers | CSRF gets its own day |
+| **No HTTPS** | `Secure` cookies need HTTPS in production; localhost is the only exception | A production deployment concern |
+| **Usernames are revealed at signup** | Fine for public usernames, not for sensitive apps | Email-verified signup |
+
+---
+
+## ✅ Day 3 recap
+
+| Concept | What it actually means |
+|---|---|
+| **Session** | Prove identity once (slow), get a random key, show the key from then on (fast) |
+| **The server holds the truth** | The browser has only a meaningless ID. Meaning and control live on the server. |
+| **Cookie** | Two headers: `Set-Cookie` (server → browser), `Cookie` (browser → server, automatic) |
+| **Bearer key** | Whoever holds the session ID *is* the user. Everything else protects that string. |
+| **`crypto.randomBytes`, not `Math.random`** | `Math.random` is predictable from its outputs. 256 OS-random bits can't be guessed. |
+| **Store `sha256(id)`** | A leaked store holds no working logins. Fast hash is right because the input isn't guessable. |
+| **`HttpOnly`** | Stops XSS *stealing* the ID. Doesn't stop XSS *using* it. |
+| **`Secure`** | Never over plain HTTP. Firesheep is why. |
+| **`SameSite=Lax`** | No cookie on cross-site POSTs. Never change state with a GET. |
+| **`Max-Age`** | A courtesy to the browser, not security. The server's expiry is the law. |
+| **Idle + absolute timeout** | Idle catches the walk-away. Absolute caps a stolen session that's kept busy. |
+| **Logout** | Delete the server record. Clearing the cookie is just tidying up. |
+| **Session fixation** | Planted ID + login that keeps it = attacker is you. **Always issue a new ID at login.** |
+| **`Map`, not `{}`** | User-controlled keys + inherited properties = a one-request crash |
+| **Request ID** | A non-secret label linking a vague 500 to the exact detailed log line |
+| **Scale** | In-memory sessions die on restart and don't share between servers. Shared store fixes it. |
+| **Sessions vs JWT** | Not old vs new. Revocable truth on the server vs self-contained truth in the token. |
+
+---
+
+## 🧠 Self-check (no peeking)
+
+1. Why not just send the username and password with every request? Give at least two reasons, one of them from Day 2.
+2. An attacker steals a backup of your session table. Why can't they log in with any of it? And why is fast SHA-256 fine here when it's wrong for passwords?
+3. `Math.random()` gives you a number with 16 digits. Why is that still not good enough for a session ID?
+4. A cookie has `Max-Age=3600`. A thief copied it 2 hours ago. Is it still valid? **What decides that?**
+5. Your session cookie is `HttpOnly`, and your site has an XSS bug. What can the attacker's script still do?
+6. Walk through session fixation step by step. Which single behaviour in the login route makes it possible?
+7. A session store is a plain `{}`. What happens when a request arrives with `Cookie: sid=constructor`, and why?
+8. Your company says *"we're modern, we use JWTs."* A user reports their laptop was stolen and asks you to log it out **right now**. What do you need that a pure JWT setup doesn't have?
+
+If #7 came to you instantly, you're already thinking like the person who finds the bug, not the person who ships it.
+
+---
+
+## 🔮 Coming up — Day 04
+
+Today the server remembered you by **looking you up**. Every request, a trip to the store.
+
+Tomorrow we flip it around: **JWT, JSON Web Tokens**, the "wristband" from the end of this page. We'll build one from scratch in pure Node: the three parts (header, payload, signature), why anyone can *read* a token but nobody can *change* it, and how the server verifies it without looking anything up. Then we'll find exactly where that design is brilliant, where it's dangerous, and the famous attacks that came from getting one small detail wrong.
+
+---
+
+## 🌱 This is open source — help make it better
+
+I'm writing these notes while learning, in the open, because this is the explanation **I wish I'd found** when I started. Not "use `express-session` and move on", but *why every line exists and what breaks without it*.
+
+We're all learning in an era where it's easy to get an answer and hard to get an understanding. These notes are my attempt at the second one — and they get better when other people push on them.
+
+**So please — fork it, open an issue, send a PR:**
+
+- 🐛 **Found a mistake?** Open an issue. I'd much rather be corrected in public than stay wrong in private.
+- 🤔 **Something unclear?** That's a bug in the writing, not a gap in you. Tell me which paragraph lost you and I'll rewrite it.
+- 💡 **Know a sharper analogy, a better diagram, or an attack I missed?** Send it. Especially if you've seen this stuff break in production.
+- 🌍 **Want to translate a day into your language?** Go for it. More beginners reached is the entire point.
+- ⭐ **Just learning along?** A star genuinely helps other beginners find it.
+
+No contribution is too small. Fixing one confusing sentence helps the next person who reads it at 11pm wondering if they're the only one who doesn't get cookies.
+
+> **You're not. I didn't either. That's why this repo exists.**
+
+---
+
+<div align="center">
+
+**Day 1: the server couldn't remember you.**
+**Day 2: it learned to check you without knowing your password.**
+**Day 3: it remembers you — and can forget you the instant it needs to. 🔥**
+
+[⬅️ Day 02](day-02-password-hashing.md) · [⬆️ README](../../README.md) · [Day 04 ➡️ _(coming soon)_](#)
+
+</div>
