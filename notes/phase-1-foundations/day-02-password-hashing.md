@@ -871,7 +871,130 @@ There's a full walkthrough with measured numbers in [the enumeration section bel
 > `hashSync` **blocks the entire Node process** while it runs. That is unacceptable inside a request handler — one login would freeze every other user's request for 244ms. But this line runs **once, at startup**, before the server accepts any traffic. Blocking for a quarter second there costs nothing. Same reasoning for the seeded legacy account below.
 > **Rule: `*Sync` at startup is fine. `*Sync` inside a request handler is a performance bug.**
 
-When you call bcrypt.hashSync(), you are telling Node.js: "Drop everything, use 100% of your brainpower to crunch this heavy math, and do not move to the next line of code until you are completely finished.
+> ### 🙋 WAIT — what does `hashSync` actually *stop*? And if it freezes the server, is this `DUMMY_HASH` trick only good for a small project — not a real app with thousands of users and patient or bank data?
+>
+> I had this exact question, and I got it half wrong the first time. Here's the part I had right: **`*Sync` inside a login route would wreck a big app.** Here's the part I had wrong: I thought that meant `DUMMY_HASH` itself was a "small project only" trick. It's the opposite. Step by step:
+>
+> ---
+>
+> **① What `hashSync` is doing for those 244ms**
+>
+> bcrypt is *meant* to be slow. Cost 12 means 4,096 rounds of heavy math, and that's what makes guessing billions of passwords impossible. That math has to run on *some* CPU thread. The only question is **which one**.
+>
+> Your JavaScript runs on **one single thread.** One. Every request from every user goes through it, one piece at a time. Think of a coffee shop with **one cashier** at the counter and **four baristas** in the back (Node's background thread pool — four by default):
+>
+> ```txt
+> bcrypt.hashSync / compareSync          await bcrypt.hash / compare
+> ─────────────────────────────          ───────────────────────────
+> The CASHIER makes the drink            The cashier passes the order to
+> themselves. For 244ms nobody           a BARISTA in the back and turns
+> is served. Nobody is even              straight back to the counter.
+> greeted. The queue just grows.         The queue keeps moving.
+>
+> Whole server: FROZEN                   Whole server: still answering
+> ```
+>
+> So "it stops the server" means exactly this: **while a `*Sync` call runs, your server can't answer *any* request from *anyone*. Not a login, not a home page, not a health check.** It doesn't crash. It's just completely busy.
+>
+> ---
+>
+> **② "Startup" doesn't mean "a small app with no users"**
+>
+> It means **the first moment of the process**: the second after you run `node server.js`, before `server.listen()` opens the door. Follow the file from top to bottom:
+>
+> ```txt
+> $ node server.js                      ← you deploy, or the server restarts
+>   line 33   DUMMY_HASH = hashSync()   ← freezes ~244ms. Who's waiting? NOBODY.
+>   line 37   legacy_user hashSync()    ← same. The door isn't even open yet.
+>   line 199  server.listen(3000)       ← door opens. hashSync never runs again.
+>
+> ...three months later, 10,000 users online...
+>
+>   someone types a WRONG username
+>   → line 137:  await bcrypt.compare(password, DUMMY_HASH)
+>   → a barista does the math in the back
+>   → the server keeps serving everyone else. NO freeze.
+> ```
+>
+> `DUMMY_HASH` is **made** once with `hashSync`. After that it's just a 60-character string sitting in memory. It's **used** on every failed login, through `await bcrypt.compare`, which never freezes anything. Making it and using it are two different lines, and they run at two different times.
+>
+> A big app with a million users and twenty servers works the same way. Each server runs line 33 **once when it boots.** The load balancer only sends it traffic after it's up and listening. No real user ever pays for those 244ms.
+>
+> ---
+>
+> **③ So when exactly is it a disaster?**
+>
+> It's not about *when you add the line* or *how big your app is*. It's about **where the line lives**:
+>
+> | Where the line is | `hashSync` / `compareSync` | `await hash` / `compare` |
+> |---|:---:|:---:|
+> | Top of the file, before `server.listen()` | ✅ runs once, nobody waits | ✅ also fine |
+> | **Inside a route** (`/login`, `/register`) | ❌ **freezes everyone, on every request** | ✅ correct |
+>
+> Adding `DUMMY_HASH` to an app that's *already live* is fine too. You deploy, the server restarts, line 33 runs once at boot, done. The disaster is **this**, and it hurts from the very first login:
+>
+> ```js
+> // ❌ NEVER — Sync inside a route
+> if (!user) {
+>   bcrypt.compareSync(password, DUMMY_HASH);   // the cashier makes the drink
+>   return sendJSON(res, 401, { error: "Invalid credentials" });
+> }
+> ```
+>
+> > 🧪 **PROVEN ON MY MACHINE** — a tiny server with two login routes (one `compareSync`, one `await compare`, both cost 12) and a `/home` page that does **no hashing at all**. I fired N wrong logins at once, then opened `/home` while they were running:
+> >
+> > ```txt
+> > /home with nobody logging in:  1.5 ms
+> >
+> >                                      compareSync     await compare
+> >                                      (in route)      (in route)
+> > 10 logins  → /home took              2,292 ms        1 ms
+> > 100 logins → /home took             22,429 ms        1 ms
+> > 100 logins → slowest login took     22,451 ms        6,108 ms
+> > ```
+> >
+> > Look at the middle row. **Someone who just wanted to open the home page waited 22 seconds**, and they weren't even logging in. That's what "freezes everyone" means in real numbers. With `await`, the same page answered in 1 ms.
+>
+> ---
+>
+> **④ One honest correction: `await` is not free either**
+>
+> Look at the bottom row again. With `await`, 100 logins at once didn't each take 244ms. **The slowest one waited 6.1 seconds.** Why? Four baristas. 100 orders ÷ 4 = 25 rounds × ~240ms ≈ 6 seconds.
+>
+> So `await` protects **everyone else**: the home page, the patient checking a report, the health check. It does **not** make bcrypt cheap. Every login still costs real CPU, and that's on purpose. Big apps handle the load with things that sit *around* bcrypt, not by making it faster:
+>
+> - **Rate limiting.** One IP or one account can't fire 100 login attempts a second. That stops attackers *and* protects your CPU. It's coming later in this series.
+> - **More servers.** Run several copies behind a load balancer, and each one brings its own baristas.
+> - **Never lower the cost to "fix" speed.** That's trading your users' passwords for a faster graph.
+>
+> ---
+>
+> **⑤ For patient data, bank data, anything sensitive: `DUMMY_HASH` is a must, not a nice-to-have**
+>
+> In a normal app, leaking "this account exists" is bad. In a high-security app, **the fact that an account exists is itself the secret:**
+>
+> | The app | What "this email has an account" tells an attacker |
+> |---|---|
+> | A hospital's patient portal | This person is a **patient there**. That's medical information, leaked without a single password. |
+> | A clinic that treats one specific illness | This person **has that illness.** |
+> | A bank | This person banks here. Now the phishing email says *"Dear customer of `<your actual bank>`"* and looks completely real. |
+>
+> Without `DUMMY_HASH`, the attacker just needs a list of emails and a stopwatch: ~0ms = no account, ~244ms = account. **With it, every answer takes the same time and says the same thing**, so the stopwatch tells them nothing.
+>
+> This isn't a classroom trick. **Django**, one of the most widely used web frameworks in the world, does exactly this inside its own login code. When the user doesn't exist, it still runs the password hasher once, with a comment saying it's there *"to reduce the timing difference between an existing and a nonexistent user."* Same idea, same reason.
+>
+> ---
+>
+> **The whole thing in one rule.** Stop asking *"is my app big or small?"* Ask this instead:
+>
+> ```txt
+> Will this line run while a user is waiting for a response?
+>
+>   NO  → top of the file, before server.listen()   →  *Sync is fine
+>   YES → inside a route / request handler           →  always await
+> ```
+>
+> Small app or a hospital with a million patients, that rule never changes.
 
 ---
 
