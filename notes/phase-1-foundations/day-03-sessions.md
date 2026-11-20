@@ -638,3 +638,870 @@ Fixation is the attacker planting a key. Hijacking is them stealing yours. Here'
 >
 > Look at the proof in the logout section: the attacker sent `EvilBox/6.6` and still got in. That's deliberate. Today's server uses the user agent only as a **label** in the "your devices" list, so a human can spot *"wait, I don't own a device called that"* and hit log out everywhere. Big services use it as one weak signal among many (location, time of day, behaviour) for flagging suspicious activity, not as a lock.
 
+---
+
+## 💻 The code
+
+Full runnable version: [`code/day-03-sessions/`](../../code/day-03-sessions/)
+
+> [!TIP]
+> **Read this code first. Don't scroll past it.**
+>
+> Go top to bottom and try to work out what each line is doing on your own: no Google, no AI, no scrolling ahead. You will hit lines that make no sense. *Why a `Map` and not a normal object? Why hash an ID that's already random? Why is there a `catch` with no `(err)` in one place and `catch (err)` in another? What is `.unref()`?*
+>
+> **When you read this code you'll have doubts. I'm 100% sure that's not a gap in your knowledge — that's what learning something new feels like.** I'm a beginner here too, and I had exactly those questions while writing it. So underneath, I've answered every one of them, in the order they hit me.
+>
+> Read it yourself first. Then come down and check your guesses. If a question of yours isn't answered down there, that's a gap in *my* writing — [tell me](#-this-is-open-source--help-make-it-better) and I'll add it.
+
+```js
+const http = require("http");
+const crypto = require("crypto"); // built into Node: secure randomness + SHA-256
+const bcrypt = require("bcrypt");
+
+// ─── Settings ──────────────────────────────────────────────────────────────
+const PORT = 3000;
+const SALT_ROUNDS = 12;
+const MAX_PASSWORD_BYTES = 72;
+
+const COOKIE_NAME = "sid";
+
+// Two different clocks. A session dies when EITHER one runs out.
+const IDLE_TIMEOUT_MS = Number(process.env.IDLE_TIMEOUT_MS) || 15 * 60 * 1000; // 15 min
+const ABSOLUTE_TIMEOUT_MS = Number(process.env.ABSOLUTE_TIMEOUT_MS) || 8 * 60 * 60 * 1000; // 8 h
+
+// What a real session ID looks like: exactly 64 hex characters (32 bytes).
+const SESSION_ID_FORMAT = /^[0-9a-f]{64}$/;
+
+// ─── In-memory stores ──────────────────────────────────────────────────────
+// Map, NOT a plain {}.
+const users = new Map(); //    username        → { passwordHash }
+const sessions = new Map(); // sha256(sessionId) → { username, cart, createdAt, lastSeenAt, userAgent }
+
+// Same decoy as Day 2. Generated at startup, so it always matches SALT_ROUNDS.
+const DUMMY_HASH = bcrypt.hashSync("a-password-nobody-will-ever-use", SALT_ROUNDS);
+
+// ─── Errors we throw on purpose ────────────────────────────────────────────
+function clientError(statusCode, message) {
+  const err = new Error(message);
+  err.statusCode = statusCode;
+  return err;
+}
+
+// ─── Session helpers ───────────────────────────────────────────────────────
+function hashId(sessionId) {
+  return crypto.createHash("sha256").update(sessionId).digest("hex");
+}
+
+function parseCookies(req) {
+  const cookies = new Map();
+  const header = req.headers.cookie;
+  if (!header) return cookies;
+
+  for (const pair of header.split(";")) {
+    const eq = pair.indexOf("=");
+    if (eq === -1) continue; // not a name=value pair, ignore it
+    const name = pair.slice(0, eq).trim();
+    const value = pair.slice(eq + 1).trim();
+    if (!cookies.has(name)) cookies.set(name, value); // first one wins
+  }
+  return cookies;
+}
+
+function isExpired(record, now) {
+  return (
+    now - record.lastSeenAt > IDLE_TIMEOUT_MS ||
+    now - record.createdAt > ABSOLUTE_TIMEOUT_MS
+  );
+}
+
+function getSession(req) {
+  const sessionId = parseCookies(req).get(COOKIE_NAME);
+  if (!sessionId || !SESSION_ID_FORMAT.test(sessionId)) return null;
+
+  const key = hashId(sessionId);
+  const record = sessions.get(key);
+  if (!record) return null;
+
+  const now = Date.now();
+  if (isExpired(record, now)) {
+    sessions.delete(key); // the server decides it's over, not the cookie
+    return null;
+  }
+
+  record.lastSeenAt = now; // activity resets the idle clock
+  return { key, record };
+}
+
+function setSessionCookie(res, sessionId) {
+  res.setHeader(
+    "Set-Cookie",
+    [
+      `${COOKIE_NAME}=${sessionId}`,
+      "HttpOnly",
+      "Secure",
+      "SameSite=Lax",
+      "Path=/",
+      `Max-Age=${Math.floor(ABSOLUTE_TIMEOUT_MS / 1000)}`,
+    ].join("; ")
+  );
+}
+
+function clearSessionCookie(res) {
+  res.setHeader(
+    "Set-Cookie",
+    `${COOKIE_NAME}=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0`
+  );
+}
+
+function startSession(req, res, { username, cart }) {
+  const sessionId = crypto.randomBytes(32).toString("hex"); // 256 bits from the OS
+  const key = hashId(sessionId);
+  const now = Date.now();
+  const record = {
+    username, // null = a guest (not logged in yet)
+    cart,
+    createdAt: now,
+    lastSeenAt: now,
+    userAgent: req.headers["user-agent"] || "unknown",
+  };
+
+  sessions.set(key, record);
+  setSessionCookie(res, sessionId);
+  return { sessionId, key, record };
+}
+
+function short(id) {
+  return id.slice(0, 8) + "…";
+}
+
+// ─── Request helpers (same as Day 2, errors upgraded) ──────────────────────
+function parseBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = "";
+    req.on("data", (chunk) => (body += chunk.toString()));
+    req.on("end", () => {
+      let data;
+      try {
+        data = JSON.parse(body);
+      } catch {
+        // No (err) on purpose: we replace JSON.parse's message with our own.
+        return reject(clientError(400, "Invalid JSON"));
+      }
+      // `null`, `42` and `[1,2]` are all valid JSON, but none is the object we need.
+      if (data === null || typeof data !== "object" || Array.isArray(data)) {
+        return reject(clientError(400, "Expected a JSON object"));
+      }
+      resolve(data);
+    });
+    req.on("error", reject);
+  });
+}
+
+function sendJSON(res, statusCode, data) {
+  res.writeHead(statusCode, { "Content-Type": "application/json" });
+  res.end(JSON.stringify(data, null, 2));
+}
+
+// ─── Routes ────────────────────────────────────────────────────────────────
+async function route(req, res) {
+  const { method, url } = req;
+
+  if (method === "POST" && url === "/register") {
+    const { username, password } = await parseBody(req);
+
+    if (typeof username !== "string" || typeof password !== "string" || !username || !password) {
+      throw clientError(400, "Username and password required");
+    }
+    if (password.length < 8) {
+      throw clientError(400, "Password must be at least 8 characters");
+    }
+    if (Buffer.byteLength(password, "utf8") > MAX_PASSWORD_BYTES) {
+      throw clientError(400, `Password must be at most ${MAX_PASSWORD_BYTES} bytes`);
+    }
+    if (users.has(username)) {
+      throw clientError(409, "Username is already taken");
+    }
+
+    users.set(username, { passwordHash: await bcrypt.hash(password, SALT_ROUNDS) });
+    console.log(`[REGISTER] ${username}`);
+    return sendJSON(res, 201, { message: "Registered. Now log in." });
+  }
+
+  if (method === "POST" && url === "/login") {
+    const { username, password } = await parseBody(req);
+
+    if (typeof username !== "string" || typeof password !== "string" || !username || !password) {
+      throw clientError(400, "Username and password required");
+    }
+
+    const user = users.get(username);
+    const ok = await bcrypt.compare(password, user ? user.passwordHash : DUMMY_HASH);
+    if (!user || !ok) {
+      throw clientError(401, "Invalid credentials");
+    }
+
+    // ★ SESSION FIXATION DEFENCE
+    const current = getSession(req);
+    const cart = current ? current.record.cart : [];
+    if (current) sessions.delete(current.key);
+
+    const { sessionId } = startSession(req, res, { username, cart });
+    console.log(`[LOGIN] ${username} → new session ${short(sessionId)}` +
+      (current ? " (old session destroyed)" : ""));
+
+    return sendJSON(res, 200, { message: `Welcome ${username}!`, cart });
+  }
+
+  if (method === "POST" && url === "/cart") {
+    const { item } = await parseBody(req);
+    if (typeof item !== "string" || !item) throw clientError(400, "item required");
+
+    const current = getSession(req) || startSession(req, res, { username: null, cart: [] });
+    current.record.cart.push(item);
+
+    return sendJSON(res, 200, {
+      cart: current.record.cart,
+      loggedInAs: current.record.username, // null for a guest
+    });
+  }
+
+  if (method === "GET" && url === "/profile") {
+    const current = getSession(req);
+    if (!current || !current.record.username) {
+      throw clientError(401, "Not logged in");
+    }
+    const s = current.record;
+    return sendJSON(res, 200, {
+      user: s.username,
+      cart: s.cart,
+      loggedInAt: new Date(s.createdAt).toISOString(),
+      idleLogoutAt: new Date(s.lastSeenAt + IDLE_TIMEOUT_MS).toISOString(),
+      hardLogoutAt: new Date(s.createdAt + ABSOLUTE_TIMEOUT_MS).toISOString(),
+    });
+  }
+
+  if (method === "GET" && url === "/sessions") {
+    const current = getSession(req);
+    if (!current || !current.record.username) throw clientError(401, "Not logged in");
+
+    const mine = [];
+    for (const [key, s] of sessions) {
+      if (s.username !== current.record.username) continue;
+      mine.push({
+        device: s.userAgent,
+        loggedInAt: new Date(s.createdAt).toISOString(),
+        lastSeenAt: new Date(s.lastSeenAt).toISOString(),
+        thisDevice: key === current.key,
+      });
+    }
+    return sendJSON(res, 200, { sessions: mine });
+  }
+
+  if (method === "POST" && url === "/logout") {
+    const current = getSession(req);
+    if (current) {
+      sessions.delete(current.key); // ★ the ID is now dead, everywhere, instantly
+      console.log(`[LOGOUT] ${current.record.username ?? "guest"}`);
+    }
+    clearSessionCookie(res);
+    return sendJSON(res, 200, { message: "Logged out" });
+  }
+
+  if (method === "POST" && url === "/logout-all") {
+    const current = getSession(req);
+    if (!current || !current.record.username) throw clientError(401, "Not logged in");
+
+    const username = current.record.username;
+    let killed = 0;
+    for (const [key, s] of sessions) {
+      if (s.username === username) {
+        sessions.delete(key);
+        killed++;
+      }
+    }
+    clearSessionCookie(res);
+    console.log(`[LOGOUT-ALL] ${username}: ${killed} session(s) destroyed`);
+    return sendJSON(res, 200, { message: `Logged out of ${killed} session(s)` });
+  }
+
+  if (method === "GET" && url === "/debug") {
+    return sendJSON(res, 200, {
+      users: [...users].map(([name, u]) => ({ username: name, passwordHash: u.passwordHash })),
+      sessions: [...sessions].map(([key, s]) => ({
+        storedKey: key,
+        username: s.username,
+        cart: s.cart,
+      })),
+    });
+  }
+
+  throw clientError(404, "Route not found");
+}
+
+// ─── Server — one place that catches every error ───────────────────────────
+const server = http.createServer(async (req, res) => {
+  const requestId = crypto.randomBytes(4).toString("hex");
+  res.setHeader("X-Request-Id", requestId);
+
+  try {
+    await route(req, res);
+  } catch (err) {
+    if (err.statusCode) {
+      return sendJSON(res, err.statusCode, { error: err.message });
+    }
+    console.error(`[req-${requestId}] ${req.method} ${req.url} failed:`, err);
+    return sendJSON(res, 500, { error: "Internal server error", requestId });
+  }
+});
+
+// ─── Housekeeping: sweep out sessions nobody came back for ─────────────────
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, s] of sessions) {
+    if (isExpired(s, now)) sessions.delete(key);
+  }
+}, 60 * 1000).unref();
+
+server.listen(PORT, () => console.log(`🍪 Day 3 server running on http://localhost:${PORT}`));
+```
+
+---
+
+## 🔬 Line by line — the parts that are new since Day 2
+
+Day 2 covered `bcrypt`, `parseBody`, the `try/catch` around `JSON.parse`, `req.on("error")`, `DUMMY_HASH` and the 72-byte check. Those ideas carry straight over. **These are the genuinely new pieces.**
+
+> [!TIP]
+> **If any part of this feels heavy — don't worry. I had exactly the same questions.**
+>
+> Every `🙋 WAIT —` block below is a question that genuinely stopped me while writing this code. *Why a `Map`? Who creates the `Error` object? Does `console.error` show up in the user's browser?* None of it clicked on the first pass for me either, so I've written every answer out below, in the order they hit me.
+>
+> Read it once for the shape, run the code, then come back. The second pass is where it clicks.
+
+---
+
+### The second built-in import
+
+```js
+const crypto = require("crypto");
+```
+
+Like `http`, this is **built into Node**. No `npm install`. It's where all the serious security tools live: secure random bytes (`randomBytes`), hashing (`createHash`), and constant-time comparison (`timingSafeEqual`). Today we use the first two.
+
+---
+
+### Settings you can change from the terminal
+
+```js
+const IDLE_TIMEOUT_MS = Number(process.env.IDLE_TIMEOUT_MS) || 15 * 60 * 1000;
+```
+
+`process.env` holds **environment variables**: settings passed in from outside the program. Start the server with `IDLE_TIMEOUT_MS=5000 node server.js` and this line reads `"5000"`.
+
+Three things happen on that one line:
+
+1. Environment variables are **always strings**, so `Number(...)` converts `"5000"` to `5000`.
+2. If the variable isn't set, `process.env.IDLE_TIMEOUT_MS` is `undefined`, and `Number(undefined)` is `NaN`.
+3. `NaN` is *falsy*, so `||` falls back to the default: `15 * 60 * 1000` = 900,000 ms = 15 minutes.
+
+**Why bother?** So you can watch a session expire in 5 seconds instead of waiting 15 minutes, without editing the code. Real apps configure every timeout, port and secret this way.
+
+---
+
+### Rejecting anything that doesn't look like our ID
+
+```js
+const SESSION_ID_FORMAT = /^[0-9a-f]{64}$/;
+
+if (!sessionId || !SESSION_ID_FORMAT.test(sessionId)) return null;
+```
+
+A regular expression meaning: *from start (`^`) to end (`$`), exactly 64 characters, each one `0-9` or `a-f`.* That's precisely what `randomBytes(32).toString("hex")` produces, so **every real session ID passes and nothing else does.**
+
+**What breaks without it?** Nothing dramatic, because the Map lookup would just miss. But anything the attacker sends in a cookie would go straight into SHA-256 and the store lookup. Checking the shape first is cheap, and it's a habit worth building: **validate untrusted input at the door, before it touches anything that matters.**
+
+---
+
+### Why `new Map()` and not `{}` — the one-cookie crash
+
+```js
+const users = new Map();
+const sessions = new Map();
+```
+
+> ### 🙋 WAIT — every tutorial stores sessions in a plain object, `const sessions = {}`. Why a `Map`?
+>
+> Because the first version of this server used a plain object, and **one request crashed the whole thing.** Not a login attempt. Not a flood of traffic. One cookie:
+>
+> > 🧪 **PROVEN ON MY MACHINE** — first draft (plain `{}` store, raw IDs, no central `try/catch`)
+> >
+> > ```txt
+> > $ curl localhost:3000/profile -H "Cookie: sessionId=constructor"
+> > (no response)
+> >
+> > RangeError: Invalid time value
+> >     at Date.toISOString (<anonymous>)
+> >     at Server.<anonymous> (server.js:130:51)
+> >
+> > Node.js v24.14.1                       ← the process exited. Everyone is offline.
+> >
+> > sessionId=__proto__       →  same crash
+> > sessionId=toString        →  same crash
+> > sessionId=hasOwnProperty  →  same crash
+> > ```
+>
+> Follow it step by step, because every step looks innocent:
+>
+> ```txt
+> 1. const sessionStore = {}            ← looks empty. It isn't.
+> 2. Every {} quietly inherits keys from Object.prototype:
+>    constructor, toString, hasOwnProperty, __proto__, valueOf, ...
+> 3. sessionStore["constructor"]        → the Object function    (truthy!)
+> 4. if (!session) return null           → skipped, "a session exists"
+> 5. Date.now() > session.expiresAt     → Date.now() > undefined → false
+>                                          → "not expired" 🙃
+> 6. new Date(session.createdAt)         → new Date(undefined) → Invalid Date
+> 7. .toISOString()                      → throws RangeError
+> 8. the /profile route had no try/catch → uncaught exception → process exits
+> ```
+>
+> Five small assumptions, each reasonable on its own, chained into **a one-request kill switch for the entire server.** That's how real vulnerabilities usually look: not one obvious mistake, but several harmless-looking ones lined up.
+>
+> **A `Map` only contains what you put into it.** `sessions.get("constructor")` is `undefined`, full stop. No inherited surprises.
+>
+> > 🧪 **PROVEN ON MY MACHINE** — today's server
+> >
+> > ```txt
+> > sid=constructor     →  401 { "error": "Not logged in" }
+> > sid=__proto__       →  401
+> > sid=toString        →  401
+> > sid=hasOwnProperty  →  401
+> > server alive        →  HTTP 200
+> > ```
+>
+> Today's server is protected **three times over**, and each layer would have stopped it alone: the format check rejects `constructor` before any lookup, the `Map` has no inherited keys, and the central `try/catch` (below) means even an unexpected throw becomes a 500 instead of a dead process.
+
+> [!NOTE]
+> **The general rule:** whenever the *keys* come from user input (usernames, cookie values, anything from a request), use a `Map`, or an object created with `Object.create(null)`, which has no prototype at all. A plain `{}` is fine for keys *you* wrote in the code.
+
+---
+
+### The decoy hash — why we don't hard-code a fake one
+
+```js
+const DUMMY_HASH = bcrypt.hashSync("a-password-nobody-will-ever-use", SALT_ROUNDS);
+```
+
+Same line as Day 2, same reason: an unknown username must cost the same bcrypt time as a real one. [Day 2 explains `hashSync` at startup in full.](day-02-password-hashing.md#the-decoy-hash--the-line-that-looks-like-dead-code)
+
+> ### 🙋 WAIT — I've seen code that just hard-codes a fake hash string like `"$2b$12$KIx5/jrHG3A3jXgRk5qXe.fake.hash.to.prevent.timing.leak"`. No startup cost. Isn't that simpler?
+>
+> I tested exactly that string. **It works today, by luck, and breaks silently in two different ways.**
+>
+> It works because bcrypt only reads the first 29 characters (`$2b$12$` plus the 22-character salt) to decide *how* to hash. The made-up tail is just compared against and fails. It's also 61 characters, one more than any real bcrypt hash, and bcrypt doesn't complain.
+>
+> > 🧪 **PROVEN ON MY MACHINE**
+> >
+> > ```txt
+> > hard-coded fake (cost 12)                  355 – 398 ms  → false
+> > real user hash after a bump to cost 13     814 – 891 ms  → false
+> > the fake, trimmed / with a typo              0.3 ms      → false   (no error!)
+> > ```
+>
+> **Break #1: you raise the cost.** Day 2 taught you to raise `SALT_ROUNDS` as hardware gets faster. Change it to 13 and real users now take ~850ms, but the hard-coded `$12$` still takes ~375ms. **The ~450ms timing gap is back**, and username enumeration with it. Nothing errors. Nothing warns you.
+>
+> **Break #2: someone tidies the string.** A teammate trims it, or a find-and-replace touches it. bcrypt can't parse it anymore and returns `false` in **0.3ms**, which is worse than having no decoy, and again with no error.
+>
+> Generating it at startup from `SALT_ROUNDS` means it **can't drift**. The cost is one 244ms pause before the server opens its door, which nobody waits for.
+
+---
+
+### Errors that carry their own status code
+
+```js
+function clientError(statusCode, message) {
+  const err = new Error(message);
+  err.statusCode = statusCode;
+  return err;
+}
+```
+
+Day 2's catch block did this:
+
+```js
+if (err.message === "Invalid JSON") return sendJSON(res, 400, ...);
+```
+
+That works, but it's fragile. Comparing message text means that the day someone fixes a typo in the message, or a second kind of 400 appears, the check silently stops matching and a client mistake turns into a 500.
+
+So instead, **errors we throw on purpose carry a `statusCode` property.** The catch block asks one question: *"did we create this on purpose?"*
+
+```txt
+err.statusCode exists   →  we threw it deliberately → the message is safe to show
+err.statusCode missing  →  something we didn't expect → it's OUR bug → log it, say nothing
+```
+
+Every route can now just `throw clientError(401, "Not logged in")` and stop. No `return sendJSON(...)` repeated in twenty places.
+
+---
+
+### Hashing the session ID
+
+```js
+function hashId(sessionId) {
+  return crypto.createHash("sha256").update(sessionId).digest("hex");
+}
+```
+
+Read it left to right like a little machine: *create a SHA-256 hasher → feed it the ID → give me the result as hex.* The whole reason it exists is in [the section above](#️-dont-store-the-session-id-store-its-hash): a stolen store must not contain working logins.
+
+---
+
+### Reading cookies by hand
+
+```js
+for (const pair of header.split(";")) {
+  const eq = pair.indexOf("=");
+  if (eq === -1) continue;
+  const name = pair.slice(0, eq).trim();
+  const value = pair.slice(eq + 1).trim();
+  if (!cookies.has(name)) cookies.set(name, value);
+}
+```
+
+The browser sends every cookie for the site in a single header:
+
+```txt
+Cookie: sid=4de8e71e...; theme=dark; lang=en
+```
+
+So we split on `;`, then split each piece at its **first** `=`. Three details matter:
+
+- **`split(";")` then `.trim()`, not `split("; ")`.** Browsers send `"; "`, but other clients don't have to. A request with `a=1;b=2` would break a parser that insists on the space.
+- **`indexOf("=")`, not `split("=")`.** A cookie *value* can contain `=` (base64 values end in `=` all the time). Cutting at the first `=` keeps the rest of the value intact.
+- **First one wins.** It's possible to receive two cookies with the same name, for example one set by your site and one planted from a subdomain. We pick a rule and stick to it, rather than whichever happens to come last.
+
+`express-session` and the `cookie` package do exactly this, with more edge cases handled. Now you know what's inside.
+
+---
+
+### Finding the session, and the sliding idle clock
+
+```js
+const record = sessions.get(key);
+if (!record) return null;
+
+const now = Date.now();
+if (isExpired(record, now)) {
+  sessions.delete(key);
+  return null;
+}
+
+record.lastSeenAt = now;
+```
+
+`Date.now()` is the current time in milliseconds since 1 January 1970. Every timestamp in the store is in that same unit, so *"how long ago"* is just subtraction.
+
+Two things to notice:
+
+- **An expired session is deleted the moment someone tries to use it.** Not just ignored, deleted.
+- **`record.lastSeenAt = now` is the sliding part.** Every request pushes the idle deadline forward. `createdAt` is never touched, which is what makes the absolute timeout absolute.
+
+---
+
+### Deleting a cookie means overwriting it
+
+```js
+`${COOKIE_NAME}=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0`
+```
+
+There's no "delete cookie" header. You send the **same cookie name**, an empty value, and `Max-Age=0`, which means *"this expired zero seconds from now"*. The browser throws it away.
+
+**The trap:** the name **and `Path`** (and `Domain`, if you used one) must match the original exactly. Send `Path=/account` when the original was `Path=/` and the browser treats it as a *different* cookie, creates it, and keeps the original. Your logout looks like it worked while the real cookie sits untouched.
+
+---
+
+### Creating a session
+
+```js
+const sessionId = crypto.randomBytes(32).toString("hex");
+const key = hashId(sessionId);
+...
+sessions.set(key, record);
+setSessionCookie(res, sessionId);
+return { sessionId, key, record };
+```
+
+The raw `sessionId` exists in exactly two places: **this function's memory for a moment, and the `Set-Cookie` header going to the browser.** It is never stored. The store gets `key`, the hash.
+
+---
+
+### Logging only the first 8 characters
+
+```js
+function short(id) {
+  return id.slice(0, 8) + "…";
+}
+```
+
+Logs get copied into monitoring tools, pasted into tickets, and shared with whoever is debugging. **A full session ID in a log line is a working login for anyone who reads that log.** Eight characters is enough to tell sessions apart while debugging and useless to an attacker.
+
+The first draft of this server logged the full ID *and* printed the whole session store on every login. Easy to do, and a genuine leak.
+
+---
+
+### Valid JSON that still isn't what we need
+
+```js
+if (data === null || typeof data !== "object" || Array.isArray(data)) {
+  return reject(clientError(400, "Expected a JSON object"));
+}
+```
+
+Day 2 [proved that valid JSON isn't automatically safe](day-02-password-hashing.md#wrapping-the-request-body-in-a-promise) (the duplicate-`username` trick). Here's another case of it. `null` is perfectly valid JSON, and so are `42` and `[1,2]`. None of them is the `{ username, password }` object we're about to pull apart:
+
+> 🧪 **PROVEN ON MY MACHINE**
+>
+> ```txt
+> without the check:  const { username } = JSON.parse("null")
+>   → TypeError: Cannot destructure property 'username' of 'JSON.parse(...)' as it is null.
+>   → the client made the mistake, but gets a 500 "our fault"
+>
+> with the check:
+>   body null    →  400 { "error": "Expected a JSON object" }
+>   body 42      →  400 { "error": "Expected a JSON object" }
+>   body [1,2]   →  400 { "error": "Expected a JSON object" }
+>   body hello   →  400 { "error": "Invalid JSON" }
+> ```
+
+`typeof null` is `"object"` in JavaScript (a famous 1995 bug that can never be fixed without breaking the web), which is why `null` needs its own check. Arrays are objects too, hence `Array.isArray`.
+
+Same idea in the routes: `typeof username !== "string"`. Someone can send `{"username": {"a": 1}}`. A `Map` will happily use an object as a key, so we make sure it's actually text before it goes anywhere near the store.
+
+---
+
+### "Username is already taken"
+
+```js
+if (users.has(username)) {
+  throw clientError(409, "Username is already taken");
+}
+```
+
+> ### 🙋 WAIT — Day 2 said "user already exists" leaks which accounts are real. But Instagram, Gmail, GitHub all say "that username is taken". Are they all wrong?
+>
+> **No. You've spotted that security and usability pull in opposite directions, and the right answer depends on what you're building.**
+>
+> **When the login name is a public username, saying "taken" is correct and unavoidable.** On Instagram anyone can visit `instagram.com/rahul` and see that the account exists. Hiding it at signup protects nothing. And without the message, a new user could never pick a unique name: they'd keep submitting the form with no idea why it isn't working. Today's server uses usernames, so it has to say it.
+>
+> **It becomes a real leak when *the account existing* is itself the private information:**
+>
+> | Kind of app | What "this email already has an account" reveals |
+> |---|---|
+> | A hospital or clinic patient portal | **This person is a patient there**, which is medical information |
+> | A mental-health or addiction-support app | Something deeply private, leaked through a signup form |
+> | A bank or crypto exchange | **Who's worth targeting.** Attackers run millions of leaked emails through the signup form and phish only the ones that match. |
+> | An internal company portal | Which employee emails are real login names |
+>
+> **How sensitive apps handle signup instead:** the login name is your **email**, and the signup form *always* says the same thing:
+>
+> ```txt
+> "Check your inbox to finish signing up."
+>
+> new email      → inbox gets  "Click here to verify your email"
+> existing email → inbox gets  "You already have an account — log in or reset your password"
+> ```
+>
+> The answer goes to the inbox, which only the real owner can read. The screen looks identical either way, so an attacker learns nothing. This needs email sending and verification links, which is its own topic.
+>
+> **What never changes, whatever kind of app it is:** login and password reset must never leak. Login gets the same message and the same timing ([Day 2's decoy hash](day-02-password-hashing.md#️-username-enumeration--the-leak-hiding-in-plain-sight)). Reset always says *"If an account exists, we've sent a link."*
+
+---
+
+### The fixation defence — four lines
+
+```js
+const current = getSession(req);
+const cart = current ? current.record.cart : [];
+if (current) sessions.delete(current.key);
+const { sessionId } = startSession(req, res, { username, cart });
+```
+
+Covered in full [in the fixation section](#-session-fixation--the-attack-hiding-inside-a-session-that-already-exists). The order matters: **read** the useful data out, **destroy** the old session, **create** a new one. What breaks if you delete the middle line? The old guest session lingers until it times out. That's not exploitable on its own, because it has no username, but it's dead weight. What breaks if you replace all four lines with *"just set `username` on the existing session"*? You saw it above: the attacker becomes alice.
+
+---
+
+### The guest session that's created on demand
+
+```js
+const current = getSession(req) || startSession(req, res, { username: null, cart: [] });
+```
+
+`||` means *"use the left side if it's truthy, otherwise run the right side"*. If the browser already has a session, use it. If not, create a guest session right here. `getSession` returns `{ key, record }` and so does `startSession`, so both sides have the same shape, and the line after works either way.
+
+This route exists to make fixation **real**: it's how an attacker gets a valid pre-login session ID to plant.
+
+---
+
+### Listing devices and logging out everywhere
+
+```js
+for (const [key, s] of sessions) {
+  if (s.username === username) {
+    sessions.delete(key);
+    killed++;
+  }
+}
+```
+
+`for...of` over a `Map` gives you `[key, value]` pairs. And yes, deleting from a `Map` while looping over it is safe in JavaScript.
+
+> [!NOTE]
+> This loop checks **every session of every user** to find alice's. Fine for a learning server, slow with a million sessions. Production stores keep a second index, *"alice → her session keys"*, so finding them is instant. In Redis that's typically a set per user.
+
+---
+
+### One `try/catch` for the whole server, and the request ID
+
+```js
+const server = http.createServer(async (req, res) => {
+  const requestId = crypto.randomBytes(4).toString("hex");
+  res.setHeader("X-Request-Id", requestId);
+
+  try {
+    await route(req, res);
+  } catch (err) {
+    if (err.statusCode) {
+      return sendJSON(res, err.statusCode, { error: err.message });
+    }
+    console.error(`[req-${requestId}] ${req.method} ${req.url} failed:`, err);
+    return sendJSON(res, 500, { error: "Internal server error", requestId });
+  }
+});
+```
+
+Day 2 had a separate `try/catch` in each route. The crash above happened in a route that **forgot** one. So today every route lives inside `route()`, and there's exactly **one** catch around all of it. A new route can't forget, because there's nothing to remember.
+
+Day 2 explained [why a 400 and a 500 are different answers for different audiences](day-02-password-hashing.md#the-catch-block--two-kinds-of-failure-two-kinds-of-answer). Today adds the **request ID** that Day 2 only mentioned in a note:
+
+> 🧪 **PROVEN ON MY MACHINE** — I added one buggy line to `/profile` (`theme: s.preferences.theme`, where `preferences` doesn't exist) and called it
+>
+> **What the user's browser receives:**
+>
+> ```txt
+> HTTP/1.1 500 Internal Server Error
+> X-Request-Id: e9d86d8f
+>
+> { "error": "Internal server error", "requestId": "e9d86d8f" }
+> ```
+>
+> **What appears in the server's terminal** (paths trimmed):
+>
+> ```txt
+> [req-e9d86d8f] GET /profile failed: TypeError: Cannot read properties of undefined (reading 'theme')
+>     at route (…/server.js)
+>     at Server.<anonymous> (…/server.js)
+> ```
+>
+> **Server still alive afterwards?** HTTP 200.
+>
+> The user sees nothing useful to an attacker. They can still say *"I got error e9d86d8f"*, and you search your logs for `req-e9d86d8f` and land on the exact line with the full stack trace. Same number, two audiences.
+
+> ### 🙋 WAIT — does `console.error` show up in the user's browser? Where does `console.log` actually go?
+>
+> It depends on **which computer is running the JavaScript file.** That's the whole answer, and it's worth getting completely clear:
+>
+> | The file runs on... | Example | `console.log` / `console.error` appears in... | Who can see it |
+> |---|---|---|---|
+> | **Your server** (Node) | `server.js`, every route here | **The server's terminal** (or a cloud log service in production) | Only you and your team |
+> | **The user's browser** | A React app, a `<script>` in your HTML | **The browser's DevTools console** (F12 → Console) | **Anyone using your site** |
+>
+> `server.js` never leaves your machine. The user's browser only ever receives what you put in `sendJSON(...)`. So `console.error(err)` in a backend catch block is **private**, and that's exactly why it's safe to log everything there.
+>
+> The flip side: **in frontend code, assume everything you log is public.** Anyone can press F12. Never `console.log` a token, a user's data, or an API response full of personal details in browser code.
+>
+> **`console.log` vs `console.error`:** both print to the terminal, but to two different *streams*. `console.log` writes to **stdout** (standard output), `console.error` to **stderr** (standard error). In a terminal they look the same. In production, log tools treat them differently: stderr gets flagged as errors, coloured red, and can trigger alerts. Use `console.error` for errors so they're findable. Bigger apps eventually swap both for a structured logger (like Pino or Winston) that writes each line as JSON with the request ID, timestamp and level attached, but the idea is identical.
+>
+> **Try it yourself:** run the server, open `http://localhost:3000/profile` in a browser, press F12, and type `console.log("hello")` into the Console tab. It appears *there*, in the browser. Your server's terminal never sees it. Two computers, two consoles.
+
+> ### 🙋 WAIT — who creates the `Error` object, JavaScript or Node? What's actually inside it?
+>
+> **`Error` is part of JavaScript itself**, so it exists in browsers and in Node. Node adds a few extra properties for system-level failures. Every error has three standard properties:
+>
+> | Property | What it holds | Show it to users? |
+> |---|---|---|
+> | `err.name` | The kind of error: `"Error"`, `"TypeError"`, `"SyntaxError"`... | No need |
+> | `err.message` | Human-readable text: `"Invalid JSON"` | Only for errors **you** wrote on purpose |
+> | `err.stack` | The file, function and line number of every step that led here | **Never.** It's a map of your code. |
+>
+> And errors arrive from two directions. **You** create them on purpose with `new Error("...")` when a rule is broken, and **JavaScript, Node, or a library** creates them automatically when something fails:
+>
+> > 🧪 **PROVEN ON MY MACHINE**
+> >
+> > ```txt
+> > created automatically by JSON.parse("{bad"):
+> >   name: SyntaxError
+> >   message: Expected property name or '}' in JSON at position 1 (line 1 column 2)
+> >
+> > created on purpose by clientError(400, "Invalid JSON"):
+> >   name: Error   message: Invalid JSON   statusCode: 400   ← our own extra property
+> >
+> > created automatically by Node when a database port is closed:
+> >   name: Error   message: connect ECONNREFUSED 127.0.0.1:5999
+> >   code: ECONNREFUSED   port: 5999                         ← Node's extras
+> > ```
+>
+> That last one is what *"the database is down"* actually looks like. `err.code` is the useful part for code (`ECONNREFUSED`: nothing listening on that port, `ENOENT`: file not found). Notice how much it reveals: IP address and port. That's why it goes to the terminal and never to the user.
+>
+> An error object is a normal object, so you can attach anything to it, which is exactly what `clientError` does with `statusCode`.
+
+> ### 🙋 WAIT — this file has `catch {` in one place and `catch (err) {` in another. Which one is right? Can I always skip the `(err)`?
+>
+> Both are valid JavaScript (skipping it has been allowed since 2019). **Both appear in today's file on purpose, and the reason is the whole lesson:**
+>
+> ```js
+> // parseBody — no variable
+> try {
+>   data = JSON.parse(body);
+> } catch {
+>   return reject(clientError(400, "Invalid JSON"));
+> }
+> ```
+>
+> Here we know **exactly** what can fail (the client sent broken JSON), and we deliberately **replace** that error with our own clean 400. The original `SyntaxError` text adds nothing, and a client's typo isn't a server problem worth logging. Not needing the variable is the honest way to write that.
+>
+> ```js
+> // the server — with a variable
+> } catch (err) {
+>   console.error(`[req-${requestId}] ...`, err);
+> ```
+>
+> Here **anything** could have gone wrong, including bugs we haven't written yet. The error object is the only evidence we'll ever have, so we need it to log `err.stack`.
+>
+> | Write | When | Verdict |
+> |---|---|---|
+> | `catch (err)` | **Almost always**, whenever you might need to know *why* it failed | The default. `err` and `error` are both standard; pick one and stay consistent. |
+> | `catch` (no variable) | Only when you know exactly what can fail **and** you're deliberately replacing or ignoring it | Rare. If you can't explain why the error doesn't matter, it does. |
+>
+> And `catch (err) { }` with an **empty body** is worse than both: you had the evidence and threw it away. [Day 2's warning about silent catch blocks](day-02-password-hashing.md#the-catch-block--two-kinds-of-failure-two-kinds-of-answer) applies everywhere, not just in auth code.
+
+---
+
+### The sweeper, and `.unref()`
+
+```js
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, s] of sessions) {
+    if (isExpired(s, now)) sessions.delete(key);
+  }
+}, 60 * 1000).unref();
+```
+
+`getSession` only deletes an expired session **when someone tries to use it.** But think about who never comes back: the user who closed the tab, the attacker who tried one stolen ID and left, every guest who added one item to a cart. Their sessions are expired but never *touched*, so they'd sit in memory forever. Slowly, the server runs out of RAM. So once a minute, this loop clears them out.
+
+**`.unref()`** tells Node: *"don't keep the program alive just for this timer."* Normally a running `setInterval` keeps the process going forever. That's fine while the server is listening, but it would stop a test script from ever exiting, or delay a clean shutdown. With `unref`, the timer runs while the server is up and doesn't hold the door open after.
+
+> [!NOTE]
+> Redis does this job for you: give a key an expiry (`EXPIRE`) and Redis deletes it on its own. That's one of several reasons it became the default home for sessions.
+
