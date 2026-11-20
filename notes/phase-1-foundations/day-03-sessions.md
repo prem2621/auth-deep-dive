@@ -444,3 +444,197 @@ Without a `Domain` attribute, the cookie is **host-only**: sent to `yourapp.com`
 > - **Don't use framework default names** like `PHPSESSID`, `JSESSIONID` or `connect.sid`. They announce your tech stack to anyone who looks. `sid` says nothing.
 > - Want to see real flags in the wild? Log into GitHub, open DevTools → **Application** → **Cookies** → `github.com`, and find the cookie named `user_session`. Look at its `HttpOnly` and `Secure` columns.
 
+---
+
+## ⏳ Expiry — two clocks, and the server owns both
+
+A session needs to end. There are two different reasons it should, and one clock can't capture both:
+
+| Clock | Question it answers | Today's value |
+|---|---|---|
+| **Idle timeout** | *"Has nobody touched this session for a while?"* The user walked away from a shared computer. | **15 minutes** |
+| **Absolute timeout** | *"How long since they actually typed their password?"* Even if they've been busy the whole time. | **8 hours** |
+
+Every request resets the idle clock (that's called a *sliding* expiry). Nothing resets the absolute clock except logging in again.
+
+**Why do you need the absolute clock at all, if the idle one already works?** Because of the attacker who stole a cookie. They can write a script that pings `/profile` once a minute, so the session never goes idle. **The absolute timeout is the one an attacker can't keep pushing back.** After 8 hours, whatever they stole dies.
+
+**How short should they be?** It depends on what's behind the door. OWASP's rough guidance:
+
+| Kind of app | Idle timeout | Absolute timeout |
+|---|---|---|
+| Banking, hospital records, admin panels | **2–5 minutes** | a few hours |
+| Ordinary low-risk apps | 15–30 minutes | 4–8 hours (a working day) |
+| "Remember me" on a social app | days or weeks | weeks, usually paired with re-checking the password before sensitive actions |
+
+Short timeouts annoy users. Long timeouts give attackers more time. **The value is a business decision about risk, not a technical constant.**
+
+> 🧪 **PROVEN ON MY MACHINE** — started with `IDLE_TIMEOUT_MS=5000` (5-second idle timeout)
+>
+> ```txt
+> t=0s   GET /profile  →  HTTP 200
+> t=3s   GET /profile  →  HTTP 200      ← activity, idle clock resets
+> t=6s   GET /profile  →  HTTP 200      ← only 3s since the last request
+> t=12s  GET /profile  →  HTTP 401  { "error": "Not logged in" }   ← 6s of silence
+>
+> is the cookie still in curl's cookie jar?  yes (1)
+> ```
+>
+> **The cookie still exists. curl still sends it. The server says no.** The key card is in your pocket, and the hotel has deactivated it.
+
+> ### 🙋 WAIT — the cookie already has `Max-Age`. Why does the server track expiry *again*?
+>
+> Because the cookie is the **client's** copy, and the client can't be trusted to throw it away. A browser respects `Max-Age`. An attacker's curl command doesn't. The proof is right above: the cookie was still sitting in the jar, still being sent, and the only thing that ended the session was the server checking its own timestamps.
+>
+> **The rule: the browser's expiry is a courtesy. The server's expiry is the law.**
+
+---
+
+## 🚪 Logout that actually logs out
+
+Here's the entire logout:
+
+```js
+sessions.delete(current.key);   // the session is gone from the server
+clearSessionCookie(res);        // ask the browser to forget the cookie too
+```
+
+The first line is the logout. The second is only tidying up. If the browser ignored the clear-cookie instruction, or an attacker kept a copy, it wouldn't matter: **the ID now points at nothing.** The hotel deactivated the card.
+
+**Because the server holds the list, it can do something even better: log you out *everywhere*.**
+
+You've seen this button: *"Sign out of all devices"* on Netflix, *"Sign out of all other sessions"* on GitHub, Google's list of devices with a remove button next to each. Today we build it: `GET /sessions` lists every place you're logged in, and `POST /logout-all` kills them all.
+
+> 🧪 **PROVEN ON MY MACHINE** — a laptop, a phone, and an attacker holding a stolen copy of the laptop's cookie
+>
+> ```txt
+> GET /sessions  (from the laptop)
+> { "sessions": [
+>     { "device": "curl/8.23.0", "loggedInAt": "...18:34:00.599Z", "thisDevice": true  },
+>     { "device": "Phone/1.0",   "loggedInAt": "...18:34:02.543Z", "thisDevice": false }
+> ] }
+>
+> attacker replays the laptop's cookie (User-Agent "EvilBox/6.6")  →  { "user": "alice", ... }   😱
+>
+> POST /logout-all  (from the phone)
+> { "message": "Logged out of 2 session(s)" }
+>
+> laptop   →  HTTP 401
+> attacker →  HTTP 401   ✅
+> ```
+
+That's the moment a user thinks *"I think someone's in my account"* and fixes it with one click. Remember it. It's the thing that's surprisingly hard to do with JWTs, and we'll come back to why at the end.
+
+---
+
+## 🎭 Session fixation — the attack hiding inside "a session that already exists"
+
+Most developers with years of experience have never heard of this one. You're about to understand it well enough to run it.
+
+**Session hijacking** = the attacker *steals* your session ID.
+**Session fixation** = the attacker *gives you* a session ID they already know, and waits for you to log in with it.
+
+### The hotel version
+
+A friendly stranger at the hotel entrance hands you a key card. *"Here, this is for you."* You take it to reception and log in with your passport. The receptionist doesn't issue a new card. They just **activate the one you're holding** for your room.
+
+The stranger made a copy before handing it to you. **They now have a working key to your room.** They never saw your passport and never stole anything from you. They simply got there first.
+
+### The real version
+
+```mermaid
+sequenceDiagram
+    participant A as 😈 Attacker
+    participant V as 🙂 Victim's browser
+    participant S as 🖥️ Server
+
+    A->>S: visit the site as a guest
+    S-->>A: Set-Cookie: sid=bea3f3db...  (guest session)
+    A->>V: plant sid=bea3f3db... in the victim's browser
+    V->>S: POST /login (alice's real password)<br/>Cookie: sid=bea3f3db...
+    Note over S: ❌ vulnerable server: marks bea3f3db... as "alice"<br/>✅ fixed server: deletes it, issues a brand-new ID
+    A->>S: GET /profile  Cookie: sid=bea3f3db...
+    S-->>A: ❌ vulnerable: 200, alice's account<br/>✅ fixed: 401
+```
+
+### "But how does the attacker get their ID into my browser?"
+
+That step sounds like the hard part. Historically it was embarrassingly easy:
+
+- **Session IDs in URLs.** Old Java servers (`;jsessionid=...`) and old PHP setups would put the session ID in the link itself when cookies were off. The attacker just sent you `yoursite.com/login;jsessionid=THEIR_ID`, and the server accepted it.
+- **A sibling subdomain.** If an attacker controls *any* subdomain (`old-blog.yoursite.com`, a user-content host), that page can set a cookie for the parent domain, and your browser carries it to `yoursite.com`. The `__Host-` prefix above exists largely to block this.
+- **A shared or public computer.** The attacker opens your site, gets a guest session, notes the ID, and walks away. You sit down and log in.
+- **Any XSS** on a page that can set cookies.
+
+### "Our app doesn't even create a session before login, so we're safe?"
+
+Real apps almost always do. **A shopping cart before you sign in. Your language choice. A CSRF token for the login form itself.** All of that is a session that exists *before* you log in, and that's why today's server has a guest `/cart`: to make the attack real.
+
+### The fix — never promote an old ID
+
+```js
+const current = getSession(req);
+const cart = current ? current.record.cart : [];   // keep what's useful
+if (current) sessions.delete(current.key);          // kill the old ID
+const { sessionId } = startSession(req, res, { username, cart });   // brand-new ID
+```
+
+Whatever ID the browser walked in with dies at the moment of login. The attacker's copy now points at nothing. The cart comes along, so the user loses nothing.
+
+> 🧪 **PROVEN ON MY MACHINE** — the same attack, run against two servers
+>
+> **❌ A copy of today's server with the fix replaced by "just mark the existing session as logged in":**
+>
+> ```txt
+> attacker POST /cart as a guest             →  sid=bea3f3db...   { "loggedInAs": null }
+> attacker GET /profile                      →  401  (not logged in yet, so far so good)
+> victim logs in, carrying the planted id    →  { "message": "Welcome alice!" }
+> did login send a new Set-Cookie?           →  0   (no, same ID kept)
+> attacker GET /profile with the SAME id     →  200  { "user": "alice", ... }   💀
+> ```
+>
+> **✅ Today's real server:**
+>
+> ```txt
+> victim logs in, carrying the planted id    →  Set-Cookie: sid=71bf55f72d379ea7...   (brand-new)
+> attacker GET /profile with the old id      →  401  { "error": "Not logged in" }
+> ```
+
+> [!IMPORTANT]
+> **Regenerate the ID on *every* change in privilege, not just login:** logging in, switching to an admin role, a password change, re-entering your password for a sensitive "sudo mode" action. And the other half of the defence, which today's code also follows: **never adopt an ID the server didn't create.** We only ever look IDs up; we never take an unknown ID from a browser and start using it.
+
+---
+
+## 🕵️ Session hijacking — when the attacker steals a live ID
+
+Fixation is the attacker planting a key. Hijacking is them stealing yours. Here's every common way it gets stolen, and what stands in the way:
+
+| How the ID gets stolen | What defends against it |
+|---|---|
+| XSS script reads `document.cookie` | `HttpOnly` (and escaping output so the script never gets in) |
+| Sniffed on open Wi-Fi | `Secure` + HTTPS everywhere |
+| Leaked database or backup | Storing `sha256(id)`, not the ID |
+| Written into log files | Never logging full IDs (today's `short()` helper) |
+| Malware on the user's own computer copies the browser's cookie files | **No cookie flag can stop this.** Only short timeouts, "log out everywhere", and asking for the password again before dangerous actions limit the damage. |
+
+> ### 📜 CASE FILE — Linus Tech Tips, March 2023
+>
+> *Real-world history. How a channel with millions of subscribers was taken over without a password.*
+>
+> An employee at Linus Media Group opened what looked like a sponsorship offer. The attachment was malware. It quietly copied the **session cookies** out of the browser on that machine and sent them to the attackers.
+>
+> With those cookies, the attackers didn't need a password, and they didn't need 2FA. As far as YouTube's servers were concerned, they **were** the logged-in staff. They took over the company's YouTube channels, renamed the main one, and streamed crypto-scam videos to millions of subscribers before YouTube shut it down.
+>
+> This kind of malware is called an **infostealer**, and stealing session cookies is now one of its main jobs, precisely because a session cookie walks straight past MFA. It's why the industry is now working on ways to tie a session to the specific device it was created on, so a copied cookie stops working on another machine.
+>
+> The lesson: **a session ID is the login.** Everything we do to keep it short-lived, revocable, and visible to the user ("here are your active devices") is there for the day it gets stolen anyway.
+
+> ### 🙋 WAIT — we store the `userAgent` with each session. Why not block the request when the user agent suddenly changes? That would catch the thief.
+>
+> It sounds great, and it barely works:
+>
+> - **The user agent is just a header the client sends.** A thief copies it along with the cookie. curl changes it with `-A "anything"`.
+> - **It changes legitimately all the time.** Browser auto-updates change the version number. Blocking on that logs real users out at random.
+>
+> Look at the proof in the logout section: the attacker sent `EvilBox/6.6` and still got in. That's deliberate. Today's server uses the user agent only as a **label** in the "your devices" list, so a human can spot *"wait, I don't own a device called that"* and hit log out everywhere. Big services use it as one weak signal among many (location, time of day, behaviour) for flagging suspicious activity, not as a lock.
+
