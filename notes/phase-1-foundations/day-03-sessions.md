@@ -336,3 +336,111 @@ On every request we hash whatever arrives in the cookie and look *that* up.
 >
 > You'll often see a version that checks `if (a.length !== b.length) return false` before `timingSafeEqual`. That's needed because `timingSafeEqual` throws on different lengths, but the early return quietly leaks the secret's length. Hashing first avoids both problems.
 
+---
+
+## 🛡️ The cookie flags — what each one really stops
+
+Look at that `Set-Cookie` line again:
+
+```txt
+Set-Cookie: sid=4de8...; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=28800
+```
+
+Everything after the value is an instruction to the browser. None of it is decoration. But a lot of tutorials oversell what each flag does, so let's be precise about **what it stops and what it doesn't.**
+
+### `HttpOnly` — page JavaScript can't read it
+
+Without it, any JavaScript running on your page can do this:
+
+```js
+document.cookie   // "sid=4de8e71e827b4d66..."
+```
+
+If an attacker manages to inject a script into your page (that's XSS, cross-site scripting: a comment box that doesn't escape `<script>`, a malicious npm package), that script reads the session ID and sends it to the attacker's server. Now they're you, from their own laptop, for as long as the session lives.
+
+With `HttpOnly`, `document.cookie` simply doesn't include it. The browser still *sends* the cookie with requests, but no script can *read* it.
+
+> [!WARNING]
+> **What `HttpOnly` does NOT stop:** XSS itself. An injected script can't steal the cookie, but it can still call `fetch("/logout-all", { method: "POST" })` from your page, and the browser will attach your cookie automatically. `HttpOnly` turns *"steal the key and use it from anywhere, for days"* into *"use the key only while you're standing in the room"*. That's a huge improvement, but the real fix for XSS is never letting the script in.
+
+### `Secure` — only ever sent over HTTPS
+
+Without it, the browser will happily send your cookie over plain `http://`, in clear text, to anyone on the same network who's listening.
+
+> ### 📜 CASE FILE — Firesheep, October 2010
+>
+> *Real-world history. The browser extension that embarrassed the biggest websites on earth.*
+>
+> In 2010, most big sites used HTTPS only for the login page. Your password went encrypted. Then, to save server costs, they switched back to plain HTTP for everything after, and the **session cookie travelled in clear text on every request.**
+>
+> Security researcher Eric Butler presented **Firesheep** at the ToorCon conference: a Firefox extension that did one thing. Sit on any open Wi-Fi (a coffee shop, an airport, a university) and it listened for session cookies from Facebook, Twitter and other popular sites flying past in plaintext. It showed a sidebar full of other people's names and profile photos. **Double-click a face, and you were logged in as that person.** No password. No hacking skill. One click.
+>
+> The attack itself wasn't new. Security people had warned about it for years. What Firesheep did was make it so easy that nobody could ignore it anymore. Over the next few years the big sites moved to **HTTPS on every page**, which is now the default everywhere.
+>
+> The lesson is today's `Secure` flag in one sentence: **encrypting the login means nothing if the session ID that comes after it travels naked.**
+
+> [!NOTE]
+> **"But I'm testing on `http://localhost`. Won't `Secure` break everything?"** No. `localhost` is treated as a secure context, so the cookie still works locally. I confirmed it with curl: the cookie was stored and sent on both `http://localhost` and `http://127.0.0.1`. Modern browsers make the same exception for localhost. On a real domain over plain `http://`, the browser would refuse to send it, which is exactly what you want.
+
+### `SameSite` — don't send it on requests started by other websites
+
+Remember *"the browser attaches the cookie automatically"*? Here's the nasty side of that.
+
+You're logged in to `yourbank.com`. In another tab you visit `evil.com`, which contains a hidden form:
+
+```html
+<form action="https://yourbank.com/transfer" method="POST">
+  <input name="to" value="attacker"><input name="amount" value="50000">
+</form>
+<script>document.forms[0].submit()</script>
+```
+
+Your browser sends that POST to `yourbank.com`, and without `SameSite` **it attaches your bank's session cookie automatically**. The bank sees a valid session and moves the money. You never clicked anything. This is **CSRF** (cross-site request forgery). It's big enough to get a full day of its own later in this series.
+
+`SameSite` tells the browser when it's allowed to attach the cookie to a request that **started on a different site**:
+
+| Value | Cookie sent when another site starts the request? | The trade-off |
+|---|---|---|
+| `Strict` | **Never** | Safest. But click a link to your site *from an email or a chat app*, and you arrive **logged out**, because that navigation started somewhere else. |
+| `Lax` | **Only** for top-level GET navigation (clicking a normal link) | Links from emails still keep you logged in. Cross-site POSTs, hidden forms and background `fetch` calls get **no cookie**. |
+| `None` | Always (and it *requires* `Secure`) | Only for cookies that genuinely must work inside other sites, like embedded widgets. Never for a session. |
+
+**Today's code uses `Lax`**, the same default modern browsers fall back to when no `SameSite` is set. It blocks the hidden-form attack above, because that's a cross-site POST.
+
+> [!IMPORTANT]
+> **`Lax` comes with one rule you must never break: a GET request must never change anything.** Lax still sends the cookie on top-level GET links, so if `GET /logout-all` or `GET /delete-account` existed, a link on `evil.com` would trigger it *with* your cookie. That's why every state-changing route in today's code is a `POST`.
+>
+> High-security apps sometimes go further: `Strict` for the sensitive cookie, and a second `Lax` cookie only for knowing "is this person logged in at all" when they arrive from a link. Security vs convenience, decided per cookie.
+
+### `Path=/` — which URLs get the cookie
+
+`/` means every route on the site. It's needed because without it the browser defaults the path to the directory of the URL that set the cookie. Ours was set by `/login`, which works out to `/` anyway, but it's always better to say it explicitly.
+
+### `Max-Age=28800` — when the *browser* throws it away
+
+28,800 seconds = 8 hours. After that, the browser deletes the cookie.
+
+> [!CAUTION]
+> **`Max-Age` is not a security control.** It's an instruction to an honest browser. An attacker who has stolen the cookie into curl or a script doesn't care what `Max-Age` says, and keeps sending it forever. **Real expiry has to be enforced on the server**, which is the whole next section.
+>
+> Leave `Max-Age` out entirely and you get a *session cookie*, which the browser deletes when it closes. "Closes" is fuzzier than it sounds, though: browsers with "continue where you left off" switched on restore those cookies too.
+
+### And one flag we deliberately *didn't* set: `Domain`
+
+Without a `Domain` attribute, the cookie is **host-only**: sent to `yourapp.com` and nowhere else. Write `Domain=yourapp.com` and it's also sent to *every subdomain*, including `blog.yourapp.com`, `old-staging.yourapp.com`, and whatever forgotten marketing page lives on a third-party host. Fewer places holding your session key is better.
+
+### The corrected cheat sheet
+
+| Flag | What it does | Attack it stops | What it does **not** stop |
+|---|---|---|---|
+| `HttpOnly` | Hides the cookie from page JavaScript | XSS **stealing** the session ID | XSS **using** your session while you're on the page |
+| `Secure` | HTTPS only | Sniffing on open Wi-Fi (Firesheep) | Theft from the device itself |
+| `SameSite=Lax` | No cookie on cross-site POSTs | Classic CSRF via hidden forms | State changes done over GET (so never write those) |
+| `Max-Age` | Browser deletes it after N seconds | A forgotten cookie lingering on a shared computer | An attacker who already copied it — **only the server can stop that** |
+
+> [!TIP]
+> **Production hardening you'll see in real apps:**
+> - **Name the cookie `__Host-sid` instead of `sid`.** Browsers enforce rules on that prefix: the cookie must be `Secure`, must be `Path=/`, and must **not** have a `Domain`. That stops a sibling subdomain from overwriting your session cookie, which is one of the ways session fixation happens (below). We kept the plain name so the exercises behave the same for every reader.
+> - **Don't use framework default names** like `PHPSESSID`, `JSESSIONID` or `connect.sid`. They announce your tech stack to anyone who looks. `sid` says nothing.
+> - Want to see real flags in the wild? Log into GitHub, open DevTools → **Application** → **Cookies** → `github.com`, and find the cookie named `user_session`. Look at its `HttpOnly` and `Secure` columns.
+
