@@ -1440,6 +1440,6 @@ No contribution is too small. Fixing one confusing sentence helps the next perso
 **Today you learned it shouldn't even know your password.**
 **Two days in, and you're already designing for the breach. 🔥**
 
-[⬅️ Day 01](day-01-what-is-authentication.md) · [⬆️ README](../../README.md) · [Day 03 ➡️ _(coming soon)_](#)
+[⬅️ Day 01](day-01-what-is-authentication.md) · [⬆️ README](../../README.md) · [Day 03 ➡️](day-03-sessions.md)
 
 </div>

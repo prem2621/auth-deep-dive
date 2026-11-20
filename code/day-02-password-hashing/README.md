@@ -112,4 +112,4 @@ Duplicate key — and it's **perfectly valid JSON**, so `JSON.parse` accepts it 
 
 ## Still broken (on purpose)
 
-Login works — and the **next request still has no idea who you are.** The stateless problem from Day 1 is completely untouched. That's Day 3.
+Login works — and the **next request still has no idea who you are.** The stateless problem from Day 1 is completely untouched. That's [Day 3](../day-03-sessions/).
