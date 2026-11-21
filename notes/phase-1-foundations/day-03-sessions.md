@@ -46,17 +46,54 @@
 
 ## 🔁 Rewind — why can't the server just ask for the password every time?
 
-Day 1 proved it: **HTTP remembers nothing.** Every request arrives alone, with no memory of the one before it.
+### The problem: HTTP forgets you
 
-The obvious fix is: *fine, then send the username and password with every request.* Every click, every page, every image. Let's see why nobody does that.
+On Day 1 we proved that **HTTP has no memory.** Every time your browser loads a page, an image or some data, it sends a brand-new request. The server answers that request and then forgets it completely.
 
-**① It would melt your server.** On Day 2 we made checking a password cost **~244ms of CPU on purpose**. A single page load easily fires 20–30 requests. That's 30 × 244ms ≈ **7 seconds of bcrypt per page, per user.** The slowness that protects you from attackers would destroy you under normal traffic.
+So when your next request arrives, the server has no idea it's the same person from one second ago. **To the server, every request is a stranger knocking on the door.**
 
-**② The password would travel everywhere, all the time.** To resend it, the browser has to keep the raw password somewhere it can read it back. Every request is another chance for it to leak: a log line, a proxy, a browser extension. And people reuse passwords, so a leak here unlocks their email and their bank too.
+### The first idea: send the password with every request
 
-**③ You could never log out.** The password is still valid tomorrow. You can't say *"kill my login on that one laptop I left at the library"* without changing the password everywhere.
+A natural thought is: *"If the server keeps forgetting me, why doesn't my browser just attach my username and password to every request?"* Then every single request would prove who you are.
 
-So we do what every real system does: **prove who you are once, expensively, and get back something cheap to check for every request after.** That cheap thing is a **session**.
+It sounds simple. But it fails, for three big reasons.
+
+### Reason 1: it would make your server far too slow
+
+- On Day 2 we made checking a password **slow on purpose**: about **244 ms** of CPU work for each check. That slowness is what stops attackers from guessing millions of passwords.
+- But opening one web page is not one request. Your browser asks for the page itself, then its styles, its scripts, your profile picture, your notifications... easily **20 to 30 requests** for a single page.
+- If every one of those requests carried your password, the server would have to run that slow check every time: **30 × 244 ms ≈ 7 seconds of CPU work, for one page, for one person.**
+- Now picture hundreds of people using the site at the same time. The slowness that protects you from attackers would bring down your own server.
+
+### Reason 2: your password would be exposed again and again
+
+- To send your password on every request, the browser has to **keep your real password saved** somewhere it can read it back.
+- Then that password travels across the network 30 times for one page, and thousands of times a day. Every trip is another chance for it to leak: into a server log, through a badly built proxy, or to a sketchy browser extension.
+- And most people reuse the same password everywhere. So one leak here doesn't just expose this app. It can unlock their email, their social media and their bank account too.
+
+### Reason 3: you could never log out of just one device
+
+- Say you log in on a library computer and forget to log out.
+- That computer is simply sending your password with every request, so it stays logged in for as long as your password is valid. **The server can't tell "your laptop" apart from "the library computer"**, because both are sending the exact same password.
+- The only way to kick the library computer out is to change your password. And that logs you out **everywhere** at once: your phone, your laptop, every device you own.
+
+### The solution: check once, then use a cheap pass
+
+Real systems split this into steps:
+
+1. **Prove who you are once (slow and careful).** You send your username and password to `POST /login` one time. The server runs the slow 244 ms check.
+2. **Get a cheap pass back.** If the password is correct, the server hands your browser a long random string, for example `4de8e71e827b4d66...`. This is called a **session ID**.
+3. **Show the pass on every request after that (fast).** From now on, your browser sends the session ID instead of the password. The server just looks it up in its list, which takes a few **microseconds** instead of 244 milliseconds. (We measure this later on this page.)
+
+That one change fixes all three problems:
+
+| Problem | How the session ID fixes it |
+|---|---|
+| **Too slow** | The slow password check runs **once**, at login. Every request after that is a quick lookup. |
+| **Password exposed** | The password travels **once**. After that, only the random session ID travels, and it's useless anywhere else. |
+| **Can't log out one device** | Each device gets **its own** session ID. To kick out the library computer, the server deletes that one session. Your password and your other devices are untouched. |
+
+That cheap pass is called a **session**, and the rest of this page is about building one properly. Let's start with an everyday example that makes the whole idea easy to remember.
 
 ---
 
