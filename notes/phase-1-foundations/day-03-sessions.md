@@ -300,7 +300,26 @@ The line has two parts:
 
 ### How big is big enough?
 
-OWASP's guidance is **at least 64 bits** of real randomness. We use **256 bits** (32 bytes). Here's what that means in practice:
+To answer that, we first need to know what "32 bytes" actually means.
+
+**Bits and bytes, in one minute:**
+
+- A **bit** is the smallest piece of data a computer has: a single `0` or `1`. So one bit has 2 possible values.
+- A **byte** is 8 bits in a row, like `10111001`. One byte has 2⁸ = **256** possible values (the numbers 0 to 255).
+- Every extra byte multiplies the number of possible values by 256. **More bytes means more combinations an attacker would have to try.**
+
+Now let's compare a small ID with ours. To be fair, we'll be **generous to the attacker** and assume they can check **1 billion guesses every second**.
+
+**A small ID: 4 bytes (32 bits)**
+
+- 4 bytes give 2³² = **4,294,967,296** possible values. That's about 4.3 billion, which sounds like a lot.
+- But at 1 billion guesses a second, the attacker can try **every single one of them in about 4.3 seconds.**
+- So if session IDs were only 4 bytes, an attacker could find a live session almost immediately.
+
+**Our ID: 32 bytes (256 bits)**
+
+- 32 bytes give 2²⁵⁶ possible values. That's a number with **78 digits**.
+- Same attacker, 1 billion guesses a second. And to make it even easier for them, let's say **1 million users** are logged in right now, so the attacker wins if they hit **any one** of those sessions.
 
 > 🧪 **PROVEN ON MY MACHINE** — computed, not guessed
 >
@@ -309,28 +328,36 @@ OWASP's guidance is **at least 64 bits** of real randomness. We use **256 bits**
 > attacker with 1,000,000 live sessions to hit,
 >   making 1,000,000,000 guesses every second  : 10^54.6 years to hit ANY one of them
 > ```
->
-> The universe is about 1.4 × 10^10 years old. You'd need to run the attack for **10^44 lifetimes of the universe** to expect a single hit.
 
-Now compare a lazy 4-byte ID:
+- That's about 10⁵⁴ years: a 1 followed by 54 zeros.
+- The universe is about 14 billion years old (1.4 × 10¹⁰). So the attacker would have to keep going for about **10⁴⁴ times the age of the universe** to expect even one lucky hit.
+- In other words, guessing a 32-byte ID isn't "hard". It's simply not going to happen.
 
-```txt
-4 bytes  →  2^32 = 4,294,967,296 possible values
-at 1 billion guesses/sec  →  4.3 seconds to try every single one
-```
+**What the experts say:** OWASP, a widely respected open project that publishes web security guidance, says a session ID needs **at least 64 bits** (8 bytes) of real randomness. We use 256 bits. It costs nothing extra, and it leaves a huge safety margin.
 
-> ### 🙋 WAIT — but today's code ALSO makes a 4-byte random ID, for "request IDs". Isn't that the same mistake?
+> ### 🙋 WAIT — our server also makes a 4-byte random value, for `X-Request-Id`. Didn't we just say 4 bytes can be guessed in 4 seconds?
 >
-> Good eye. No, and the difference teaches the whole idea:
+> Good catch. Yes, a 4-byte value can be guessed quickly. But for a request ID, **being guessed doesn't matter**, and that's the whole lesson here.
 >
-> | | Session ID | Request ID |
+> Think about a **house key** and a **restaurant order number**:
+>
+> - Your **house key** has to be impossible to copy, because anyone who has it can walk into your home.
+> - Your **order number** (#42) is printed on your receipt and shouted across the counter. Everyone can see it, and knowing it lets you do nothing. It doesn't open anyone's door.
+>
+> | | Session ID (`sid`) | Request ID (`X-Request-Id`) |
 > |---|---|---|
-> | **What it does** | Proves *who you are* | Labels *one request* in the logs, so support can find it |
-> | **If an attacker guesses one** | They're logged in as you 💀 | They know a log label. That gets them nothing. |
-> | **Is it a secret?** | **Yes** | No — we literally send it to the user |
-> | **Size** | 32 bytes (256 bits) | 4 bytes is plenty |
+> | **Like a...** | House key | Restaurant order number |
+> | **Its job** | Proves who you are | Labels one request, so a developer can find it in the logs |
+> | **Is it a secret?** | **Yes.** Nobody else should ever see yours. | **No.** We send it to the user on purpose. |
+> | **If an attacker guesses one** | They're logged in as you 💀 | Nothing happens. It's just a label. |
+> | **Size** | 32 bytes | 4 bytes is enough |
 >
-> **The size of a random value depends on what happens if someone guesses it.** A session ID guards the front door. A request ID is a sticky note.
+> **So the size of a random value depends on one question: what happens if someone guesses it?** If the answer is "they become you", it must be huge. If the answer is "nothing", a short value is fine.
+>
+> Two smaller points:
+>
+> - Even the request ID is made with `crypto.randomBytes`, not `Math.random()`. If any part of the server used `Math.random()` and showed the result to the world, that result would be one more clue about the formula's hidden state, which is exactly what the attack above needs. Using `crypto` everywhere is a simple habit that removes the risk.
+> - Two requests can occasionally get the same 4-byte ID. That's fine, because every log line also has a time on it, so a rare repeat is easy to tell apart.
 
 > [!NOTE]
 > **Why hex?** 32 random bytes are raw binary, and some byte values are characters that would break a cookie header (`;`, `=`, spaces). `.toString("hex")` turns each byte into two safe characters `0-9a-f`, giving exactly 64 characters. Base64url (43 characters) would work too. Hex is just easier to read.
