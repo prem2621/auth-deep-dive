@@ -359,8 +359,47 @@ Now let's compare a small ID with ours. To be fair, we'll be **generous to the a
 > - Even the request ID is made with `crypto.randomBytes`, not `Math.random()`. If any part of the server used `Math.random()` and showed the result to the world, that result would be one more clue about the formula's hidden state, which is exactly what the attack above needs. Using `crypto` everywhere is a simple habit that removes the risk.
 > - Two requests can occasionally get the same 4-byte ID. That's fine, because every log line also has a time on it, so a rare repeat is easy to tell apart.
 
+### Why `.toString("hex")`?
+
+There's one last piece of that line to explain: why we can't put the bytes straight into the cookie.
+
+**What `randomBytes` actually gives you.** `crypto.randomBytes()` doesn't give you text. It gives you raw **bytes**: numbers from 0 to 255, stored in an object Node calls a `Buffer`.
+
+> 🧪 **PROVEN ON MY MACHINE**
+>
+> ```txt
+> crypto.randomBytes(4)       : <Buffer 76 54 fd 61>
+> the same bytes, as numbers  : 118, 84, 253, 97
+> the same bytes, as hex      : 7654fd61
+> ```
+
+**The problem: a cookie can only carry certain characters.**
+
+- A cookie travels inside an HTTP header, and a header is text with strict rules.
+- Some characters have a special job in that text. `;` separates the cookie from its rules (`; HttpOnly`). `=` separates the name from the value. A newline ends the header.
+- If our session ID happened to contain one of those characters, the browser and the server would read the header wrongly, and the login would break.
+- Raw bytes can be any of 256 values, and **most of those values are not allowed** inside a cookie.
+
+> 🧪 **PROVEN ON MY MACHINE**
+>
+> ```txt
+> byte values allowed inside a cookie value    : 90 of 256
+> chance that 32 random bytes are ALL allowed  : 3.0e-15   (about 3 in a million billion)
+> 10,000 raw 32-byte IDs tested                : all 10,000 would break the cookie
+> Node, when a raw byte is a newline           : ERR_INVALID_CHAR - Invalid character in header content
+> ```
+>
+> So raw bytes don't just *sometimes* break a cookie. They break it practically every time, and Node refuses to even send some of them.
+
+**The fix: hex.**
+
+- **Hexadecimal** ("hex") writes numbers using only 16 characters: `0–9` and `a–f`.
+- Any byte (0 to 255) always fits in exactly **two** hex characters. Look at the proof above: the byte 118 became `76`, and 253 became `fd`.
+- So 32 bytes always become exactly **64 characters**, and none of them can ever be `;`, `=`, a space or a newline.
+- That's why every session ID in this project is exactly 64 characters long. It's also why the server can reject anything that isn't 64 hex characters before even looking it up (you'll see that check in the code).
+
 > [!NOTE]
-> **Why hex?** 32 random bytes are raw binary, and some byte values are characters that would break a cookie header (`;`, `=`, spaces). `.toString("hex")` turns each byte into two safe characters `0-9a-f`, giving exactly 64 characters. Base64url (43 characters) would work too. Hex is just easier to read.
+> **Base64url** is another safe way to write bytes as text. It uses `A–Z`, `a–z`, `0–9`, `-` and `_`, so it fits the same 32 bytes into 43 characters instead of 64. Both are fine. We use hex because it's easier to read.
 
 ---
 
