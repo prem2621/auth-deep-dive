@@ -168,13 +168,15 @@ sequenceDiagram
 
 ## 🍪 What a cookie actually is
 
-Most people think of cookies as "a storage thing in the browser". That's shallow. Here's the real picture:
+Most people think a cookie is "something the browser stores". That's true, but it hides how simple cookies really are:
 
-> **A cookie is two HTTP headers. Nothing more.**
+> **A cookie is just two HTTP headers.** One goes from the server to the browser. The other goes from the browser back to the server.
 
-**Header 1, server → browser:** "please remember this"
+### Header 1: the server says "please remember this"
 
-> 🧪 **PROVEN ON MY MACHINE** — the real response from today's server after `POST /login`
+When you log in, the server's response includes a `Set-Cookie` header. Here is the real response from today's server:
+
+> 🧪 **PROVEN ON MY MACHINE** — the response to `POST /login`
 >
 > ```txt
 > HTTP/1.1 200 OK
@@ -183,16 +185,47 @@ Most people think of cookies as "a storage thing in the browser". That's shallow
 > Content-Type: application/json
 > ```
 
-**Header 2, browser → server, on every request after that:** "here it is again"
+Let's read it line by line:
+
+- `HTTP/1.1 200 OK` — the login worked.
+- `X-Request-Id: 10a35a8b` — a tracking number for this one request. We'll look at it in a moment.
+- `Set-Cookie: sid=4de8...` — the important line. It tells the browser: *"save a cookie named `sid`, with this value."*
+- `HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=28800` — these are **rules** for the browser, telling it how to store and protect the cookie. Each rule gets its own section further down this page.
+
+### Header 2: the browser says "here it is again"
+
+From now on, every time the browser sends a request to this site, it adds a `Cookie` header by itself:
 
 ```txt
 GET /profile HTTP/1.1
 Cookie: sid=4de8e71e827b4d6664243fb0cb2bb01c81c8ef3b984ab91d02c0196933d10b5d
 ```
 
-That's the entire mechanism. The browser stores the value, and from then on it **automatically** adds the `Cookie` header to every request **to that same site**. You don't write any code for that. It just happens.
+You don't write any code for this. The browser does it **automatically**, on every request, but only to the same site that set the cookie. The server reads the value, finds your session, and knows who you are.
 
-That word *automatically* is both the best and the most dangerous thing about cookies. It's why sessions feel effortless. It's also the root of an attack called CSRF, which we'll meet in the `SameSite` section below.
+That word *automatically* is both the best and the most dangerous thing about cookies. It's why sessions feel effortless for the user. It's also the root of an attack called CSRF, which we'll meet in the `SameSite` section.
+
+> ### 🙋 WAIT — the server sent `HttpOnly; Secure; SameSite=Lax; ...`, but the browser sends back only `sid=4de8...`. Where did the rules go?
+>
+> Good observation. **The rules only travel in one direction: from the server to the browser.**
+>
+> - **Server → browser (`Set-Cookie`):** the server sends the value *and* the rules. The rules tell the browser how to treat the cookie: hide it from JavaScript, only send it over HTTPS, delete it after 8 hours, and so on.
+> - **The browser keeps the rules to itself.** It saves them next to the cookie, and uses them to decide *whether* to send the cookie with each request.
+> - **Browser → server (`Cookie`):** when the rules say "yes, send it", the browser sends **only the name and the value**: `sid=4de8...`.
+>
+> The server doesn't need its own rules repeated back to it. It wrote them, and it only needs the value to find your session.
+>
+> One thing follows from this, and it matters later: **the server can never tell from the `Cookie` header whether the rules were obeyed.** It just sees a value. That's why the server has to check important things, like whether the session has expired, by itself.
+
+> ### 🙋 WAIT — what is `X-Request-Id: 10a35a8b`?
+>
+> It's a **tracking number for this one request**, like the order number printed on a restaurant receipt.
+>
+> - Our server makes a new one for every request it receives, and sends it back in this header.
+> - Whenever something goes wrong during that request, the server writes the same number into its log, next to the full error.
+> - So if a user reports *"I got an error"*, they can give support the number `10a35a8b`. A developer searches the logs for it and finds the exact problem in seconds.
+>
+> The `X-` at the start is an old naming habit for custom headers that aren't part of the official HTTP standard. You'll see why this number is only 8 characters long in the next section, and how the error handler uses it in the line-by-line walkthrough.
 
 > ### 🙋 WAIT — if a cookie is just a header, can't I just type one myself?
 >
