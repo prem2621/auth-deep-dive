@@ -245,9 +245,13 @@ That word *automatically* is both the best and the most dangerous thing about co
 
 ## 🎲 The session ID — why `Math.random()` is a vulnerability
 
-The session ID is the number on the key card. It has exactly one job: **nobody can guess it.**
+### What the session ID has to do
 
-The first thing most of us would reach for is `Math.random()`. Let's look at what it produces next to the right tool:
+The session ID is the number on the key card. It has exactly one job: **nobody should be able to guess it.**
+
+We just saw why. The server only checks the value in the cookie. So if an attacker can guess someone's session ID, they can put it in their own cookie and become that person.
+
+So we need a random value that nobody can predict. JavaScript gives us two ways to make random values. Here they are side by side:
 
 > 🧪 **PROVEN ON MY MACHINE**
 >
@@ -257,17 +261,42 @@ The first thing most of us would reach for is `Math.random()`. Let's look at wha
 > crypto.randomBytes(32) as hex  : b9ac107b4914441331336fb5678d335448ed2ba1d3437aec3400b4987853da98
 > ```
 
-They both *look* random. Only one of them is.
+To your eyes, both look random. The difference is in **how** they are made, and that difference decides whether your users are safe.
 
-**`Math.random()` is built for games and animations, not secrets.** In Node and Chrome it's made by an algorithm called **xorshift128+**. It keeps a small internal state, and every number it gives you is computed directly from that state. That makes it fast, and it also makes it **predictable**: given a handful of consecutive outputs, the internal state can be worked out with a constraint solver. Public tools exist that do exactly this. Once an attacker has the state, they can compute **every future value**, which means **every future session ID your server will hand out**.
+### How `Math.random()` makes its numbers
 
-So the attack goes like this. Log in a few times yourself, collect your own session IDs, recover the generator's state, and predict the ID the next user is about to receive.
+- `Math.random()` doesn't produce true randomness. It uses a **formula**. In Node and Chrome, that formula is called **xorshift128+**.
+- The formula keeps a small hidden value called its **internal state**. Every time you call `Math.random()`, it does some math on that state, gives you a number, and updates the state for next time.
+- So every number comes straight out of the formula. **If you know the state, you can calculate every number that comes after it.**
+- That's fine for what `Math.random()` was built for: games, animations, shuffling a playlist. Nobody gains anything by predicting where an enemy appears in a game. It was never meant to protect secrets.
 
-**`crypto.randomBytes()` comes from the operating system's cryptographically secure generator.** It's built specifically so that seeing past outputs tells you nothing about future ones. That's the only thing a session ID should ever be made from.
+### How an attacker uses that
+
+Because the numbers come from a formula, the formula can be worked backwards:
+
+1. The attacker creates a few accounts on your site and logs in with each one.
+2. Each login gives them a session ID made by `Math.random()`. These are real outputs from your server's generator.
+3. They feed those outputs into a **solver**, a program that works out which hidden state could have produced them. Free tools that do exactly this for `Math.random()` are available online.
+4. Once they know the state, they run the formula forward themselves. Now they can **calculate the session ID your server will give to the next real user who logs in**, and walk straight into that account.
+
+Notice that the attacker never guessed anything. They simply did the same math as your server.
+
+### Why `crypto.randomBytes()` is safe
+
+- `crypto` is Node's built-in security module. `crypto.randomBytes()` asks the **operating system** for random bytes.
+- The operating system collects unpredictable events from the hardware (for example, the exact timing of hardware events, and the random-number circuit built into modern CPUs). It feeds them into a **cryptographic** generator.
+- A cryptographic generator is designed so that **seeing its past outputs tells you nothing about its future ones.** An attacker could collect a million of your session IDs and still have no way to calculate the next one.
+
+That's why a session ID should only ever be made like this:
 
 ```js
 const sessionId = crypto.randomBytes(32).toString("hex");
 ```
+
+The line has two parts:
+
+- `crypto.randomBytes(32)` — *"give me 32 random bytes from the operating system."*
+- `.toString("hex")` — *"turn those bytes into text that a cookie can carry."* Why that step is needed is explained at the end of this section.
 
 ### How big is big enough?
 
